@@ -1013,6 +1013,15 @@ S:	Maintained
 F:	Documentation/hid/amd-sfh*
 F:	drivers/hid/amd-sfh-hid/
 
+AMD QDMA DRIVER
+M:	Nishad Saraf <nishads@amd.com>
+M:	Lizhi Hou <lizhi.hou@amd.com>
+L:	dmaengine@vger.kernel.org
+S:	Supported
+F:	drivers/dma/amd/qdma.c
+F:	drivers/dma/amd/qdma.h
+F:	include/linux/platform_data/amd_qdma.h
+
 AMS AS73211 DRIVER
 M:	Christian Eggers <ceggers@arri.de>
 L:	linux-iio@vger.kernel.org
