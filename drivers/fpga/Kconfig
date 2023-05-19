@@ -276,4 +276,15 @@ config FPGA_MGR_LATTICE_SYSCONFIG_SPI
 	  FPGA manager driver support for Lattice FPGAs programming over slave
 	  SPI sysCONFIG interface.
 
+config FPGA_MGR_VERSAL_MGMT
+	tristate "Versal PCIe Device Driver"
+	depends on PCI
+	help
+	  Select this option to enable PCIe driver for PCIe-based
+	  Versal card. This driver provides management functions of Versal
+	  card, including download firmware, program bitstream, clock
+	  configuration and sensor data collection.
+
+	  To compile this as a module, choose M here.
+
 endif # FPGA
