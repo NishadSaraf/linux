@@ -7,6 +7,7 @@
  * Authors:
  */
 
+#include <linux/bitfield.h>
 #include <linux/pci.h>
 #include <linux/types.h>
 #include <linux/kernel.h>
@@ -14,6 +15,10 @@
 #include <linux/delay.h>
 #include <linux/kthread.h>
 #include <linux/firmware.h>
+#include <linux/timer.h>
+#include <linux/jiffies.h>
+#include <linux/workqueue.h>
+#include <linux/uuid.h>
 
 #include "xgq_cmd_vmr.h"
 #include "xgq_xocl_plat.h"
@@ -42,6 +47,26 @@
 #define XGQ_CONFIG_TIME		msecs_to_jiffies(30 * 1000)
 #define XGQ_WAIT_TIMEOUT	msecs_to_jiffies(60 * 1000)
 #define XGQ_MSLEEP_1S		(1000)
+
+#define COMMS_CHAN_PROTOCOL_VERSION	1
+#define COMMS_CHAN_BAR		0
+#define COMMS_CHAN_BAR_OFF	0x2000000
+#define COMMS_CHAN_REGS_SIZE	0x1000
+#define COMMS_CHAN_TIMER	(HZ / 10)
+#define COMMS_DATA_LEN		16
+#define COMMS_DATA_TYPE_MASK	GENMASK(7, 0)
+#define COMMS_DATA_EOM_MASK	BIT(31)
+#define COMMS_MSG_END		BIT(31)
+
+#define COMMS_REG_WRDATA_OFF	0x0
+#define COMMS_REG_RDDATA_OFF	0x8
+#define COMMS_REG_STATUS_OFF	0x10
+#define COMMS_REG_RIT_OFF	0x1C
+#define COMMS_REG_IS_OFF	0x20
+#define COMMS_REG_IE_OFF	0x24
+#define COMMS_REG_IP_OFF	0x28
+#define COMMS_REG_ERROR_OFF	0x14
+#define COMMS_REG_CTRL_OFF	0x2C
 
 #define MAX_WAIT		30
 /*
@@ -84,6 +109,85 @@ struct xgq_worker {
 	struct vmr_drvdata	*xgq_vmr;
 };
 
+enum comms_req_ops {
+	COMMS_REQ_OPS_UNKNOWN =			0,
+	COMMS_REQ_OPS_TEST_READY =		1,
+	COMMS_REQ_OPS_TEST_READ =		2,
+	COMMS_REQ_OPS_LOCK_BITSTREAM =		3,
+	COMMS_REQ_OPS_UNLOCK_BITSTREAM =	4,
+	COMMS_REQ_OPS_HOT_RESET =		5,
+	COMMS_REQ_OPS_FIREWALL =		6,
+	COMMS_REQ_OPS_LOAD_XCLBIN_KADDR =	7,
+	COMMS_REQ_OPS_LOAD_XCLBIN =		8,
+	COMMS_REQ_OPS_RECLOCK =			9,
+	COMMS_REQ_OPS_PEER_DATA =		10,
+	COMMS_REQ_OPS_USER_PROBE =		11,
+	COMMS_REQ_OPS_MGMT_STATE =		12,
+	COMMS_REQ_OPS_CHG_SHELL =		13,
+	COMMS_REQ_OPS_PROGRAM_SHELL =		14,
+	COMMS_REQ_OPS_READ_P2P_BAR_ADDR =	15,
+	COMMS_REQ_OPS_SDR_DATA =		16,
+	COMMS_REQ_OPS_LOAD_XCLBIN_SLOT_KADDR =	17,
+	COMMS_REQ_OPS_LOAD_SLOT_XCLBIN =	18,
+	COMMS_REQ_OPS_GET_PROTOCOL_VERSION =	19,
+	COMMS_REQ_OPS_GET_XCLBIN_UUID =		20,
+	COMMS_REQ_OPS_MAX,
+};
+
+enum comms_msg_type {
+	COMMS_MSG_INVALID,
+	COMMS_MSG_TEST,
+	COMMS_MSG_START,
+	COMMS_MSG_BODY,
+};
+
+enum comms_msg_service_type {
+	COMMS_MSG_SRV_RESPONSE =	BIT(0),
+	COMMS_MSG_SRV_REQUEST =		BIT(1),
+};
+
+struct comms_hw_msg {
+	struct {
+		u32		type;
+		u32		payload_size;
+	} header;
+	struct {
+		u64	id;
+		u32	flags;
+		u32	payload_size;
+		u32	payload[COMMS_DATA_LEN - 6];
+	} body;
+} __attribute((packed));
+
+struct comms_srv_req {
+	u64			flags;
+	u32			opcode;
+	u32			data[1];
+};
+
+struct comms_srv_ver_resp {
+	u32			version;
+};
+
+struct comms_srv_uuid_resp {
+	uuid_t			uuid;
+};
+
+struct comms_msg {
+	u64			id;
+	u32			flags;
+	u32			len;
+	u32			bytes_read;
+	u32			data[10];
+};
+
+struct comms_chan {
+	struct vmr_drvdata	*vmr;
+	struct mutex		lock;
+	struct timer_list	timer;
+	struct work_struct	work;
+};
+
 struct vmr_drvdata {
 	struct pci_dev		*pdev;
 	struct xgq		xgq_queue;
@@ -102,6 +206,8 @@ struct vmr_drvdata {
 	struct semaphore	xgq_log_page_sema;
 	struct xgq_cmd_cq_default_payload xgq_cq_payload;
 	bool			xgq_vmr_program;
+	void __iomem		*comms_chan_base;
+	struct comms_chan	comms;
 };
 
 static const struct pci_device_id versal_mgmt_id_tbl[] = {
@@ -856,10 +962,173 @@ static int vmr_services_probe(struct vmr_drvdata *vmr)
 	return 0;
 }
 
+u32 comms_chan_get_xclbin_uuid(void *payload)
+{
+	struct comms_srv_uuid_resp *resp = (struct comms_srv_uuid_resp *)payload;
+
+	/* UUID of verify.xclbin */
+	resp->uuid = UUID_INIT(0xe35795bd, 0x5b08, 0x78d4, 0x4d, 0xc4, 0xdb,
+			       0x18, 0x81, 0x15, 0x9e, 0xc2);
+
+	return sizeof(*resp);
+}
+
+
+u32 comms_chan_get_protocol_version(void *payload)
+{
+	struct comms_srv_ver_resp *resp = (struct comms_srv_ver_resp *)payload;
+
+	resp->version = COMMS_CHAN_PROTOCOL_VERSION;
+
+	return sizeof(*resp);
+}
+
+void comms_chan_send_response(struct comms_chan *comms, struct comms_msg *msg)
+{
+	struct comms_srv_req *req = (struct comms_srv_req *)msg->data;
+	struct comms_hw_msg response = {0};
+	u32 size;
+	u8 i;
+
+	switch (req->opcode) {
+	case COMMS_REQ_OPS_GET_PROTOCOL_VERSION:
+		size = comms_chan_get_protocol_version(response.body.payload);
+		break;
+	case COMMS_REQ_OPS_GET_XCLBIN_UUID:
+		size = comms_chan_get_xclbin_uuid(response.body.payload);
+		break;
+	default:
+		VMR_ERR(comms->vmr, "Unsupported request opcode: %d",
+			req->opcode);
+		*response.body.payload = -1;
+		size = sizeof(int);
+	}
+
+	response.header.type = COMMS_MSG_START | COMMS_MSG_END;
+	response.header.payload_size = size;
+
+	response.body.id = msg->id;
+	response.body.flags = COMMS_MSG_SRV_RESPONSE;
+	response.body.payload_size = size;
+
+	for (i = 0; i < COMMS_DATA_LEN; i++) {
+		iowrite32(((u32 *)&response)[i], comms->vmr->comms_chan_base +
+			  COMMS_REG_WRDATA_OFF);
+	}
+}
+
+void comms_chan_check_request(struct work_struct *w)
+{
+	struct comms_chan *comms = container_of(w, struct comms_chan, work);
+	u32 status = 0, request[COMMS_DATA_LEN] = {0};
+	struct comms_hw_msg *hw_msg;
+	struct comms_msg msg;
+	u8 i, type, eom;
+
+	mutex_lock(&comms->lock);
+
+	status = ioread32(comms->vmr->comms_chan_base + COMMS_REG_IS_OFF);
+	if (!(status & BIT(1)))
+		goto exit;
+
+	/* ACK status */
+	iowrite32(status, comms->vmr->comms_chan_base + COMMS_REG_IS_OFF);
+
+	for (i = 0; i < COMMS_DATA_LEN; i++) {
+		request[i] = ioread32(comms->vmr->comms_chan_base +
+				      COMMS_REG_RDDATA_OFF);
+	}
+
+	hw_msg = (struct comms_hw_msg *)request;
+	type = FIELD_GET(COMMS_DATA_TYPE_MASK, hw_msg->header.type);
+	eom = FIELD_GET(COMMS_DATA_EOM_MASK, hw_msg->header.type);
+
+	/* Only support fixed size 64B messages */
+	if (!eom || type != COMMS_MSG_START) {
+		VMR_ERR(comms->vmr, "Unsupported message format or length");
+		goto exit;
+	}
+
+	msg.flags = hw_msg->body.flags;
+	msg.len = hw_msg->body.payload_size;
+	msg.id = hw_msg->body.id;
+
+	if (msg.flags != COMMS_MSG_SRV_REQUEST) {
+		VMR_ERR(comms->vmr, "Unsupported service request");
+		goto exit;
+	}
+
+	memcpy(msg.data, hw_msg->body.payload, hw_msg->body.payload_size);
+
+	/* Now decode and respond appropriately */
+	comms_chan_send_response(comms, &msg);
+
+exit:
+	mutex_unlock(&comms->lock);
+	return;
+}
+
+void comms_chan_sched_work(struct timer_list *t)
+{
+	struct comms_chan *comms = container_of(t, struct comms_chan, timer);
+
+	/* schedule a work in the general workqueue */
+	schedule_work(&comms->work);
+
+	/* Periodic timer */
+	mod_timer(&comms->timer, jiffies + COMMS_CHAN_TIMER);
+}
+
+static void comms_chan_finish(struct vmr_drvdata *vmr)
+{
+	struct comms_chan *comms = &vmr->comms;
+
+	/* First stop scheduling new work then cancel work */
+	del_timer_sync(&comms->timer);
+	cancel_work_sync(&comms->work);
+	mutex_destroy(&comms->lock);
+}
+
+static int comms_chan_init(struct vmr_drvdata *vmr)
+{
+	struct comms_chan *comms = &vmr->comms;
+
+	mutex_init(&comms->lock);
+
+	mutex_lock(&comms->lock);
+
+	/* Clear request and response FIFOs */
+	iowrite32(0x3, vmr->comms_chan_base + COMMS_REG_CTRL_OFF);
+
+	/* Disble interrupts */
+	iowrite32(0, vmr->comms_chan_base + COMMS_REG_IE_OFF);
+
+	/* Clear interrupts */
+	iowrite32(7, vmr->comms_chan_base + COMMS_REG_IS_OFF);
+
+	/* Setup RIT reg */
+	iowrite32(15, vmr->comms_chan_base + COMMS_REG_RIT_OFF);
+
+	/* Enable RIT interrupt */
+	iowrite32(2, vmr->comms_chan_base + COMMS_REG_IE_OFF);
+
+	mutex_unlock(&comms->lock);
+
+	/* Create and schedule timer to do recurring work */
+	timer_setup(&comms->timer, comms_chan_sched_work, 0);
+
+	mod_timer(&comms->timer, jiffies + COMMS_CHAN_TIMER);
+
+	INIT_WORK(&comms->work, comms_chan_check_request);
+
+	return 0;
+}
+
 static void versal_mgmt_remove(struct pci_dev *pdev)
 {
 	struct vmr_drvdata *vmr = pci_get_drvdata(pdev);
 
+	comms_chan_finish(vmr);
 	vmr_stop_services(vmr);
 	fini_worker(&vmr->xgq_complete_worker);
 	idr_destroy(&vmr->xgq_vmr_cid_idr);
@@ -908,8 +1177,8 @@ static int versal_mgmt_probe(struct pci_dev *pdev,
 		return -ENOMEM;
 	}
 	vmr->xgq_sq_base = tbl[XGQ_VMR_SQ_BAR] + XGQ_VMR_SQ_BAR_OFF;
+	vmr->comms_chan_base = tbl[COMMS_CHAN_BAR] + COMMS_CHAN_BAR_OFF;
 	vmr->xgq_payload_base = tbl[XGQ_VMR_PAYLOAD_BAR] + XGQ_VMR_PAYLOAD_OFF;
-
 	vmr->xgq_sq_base = vmr->xgq_sq_base + XGQ_SQ_TAIL_POINTER;
 	vmr->xgq_cq_base = vmr->xgq_sq_base + XGQ_CQ_TAIL_POINTER;
 
@@ -924,6 +1193,13 @@ static int versal_mgmt_probe(struct pci_dev *pdev,
 	init_complete_worker(&vmr->xgq_complete_worker);
 
 	(void)vmr_services_probe(vmr);
+
+	vmr->comms.vmr = vmr;
+	ret = comms_chan_init(vmr);
+	if (ret) {
+		versal_mgmt_remove(pdev);
+		return -ENODEV;
+	}
 
 	pci_set_drvdata(pdev, vmr);
 
