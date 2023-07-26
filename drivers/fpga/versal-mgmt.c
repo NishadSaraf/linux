@@ -19,9 +19,15 @@
 #include <linux/jiffies.h>
 #include <linux/workqueue.h>
 #include <linux/uuid.h>
+#include <linux/ioctl.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/module.h>
+#include <linux/miscdevice.h>
 
 #include "xgq_cmd_vmr.h"
 #include "xgq_xocl_plat.h"
+#include "xclbin.h"
 
 #define DRV_VERSION		"0.1"
 #define DRV_NAME		"versal-mgmt"
@@ -88,7 +94,24 @@
 #define VMR_ERR(vmr, fmt, args...)   dev_err(&(vmr)->pdev->dev, "%s: "fmt, __func__, ##args)
 #define VMR_DBG(vmr, fmt, args...)   dev_dbg(&(vmr)->pdev->dev, "%s: "fmt, __func__, ##args)
 
+#define ICAP_XCLBIN_V2          "xclbin2"
+
+struct versal_mgmt_ioc_xclbin {
+	char *xclbin;
+};
+
+#define VERSAL_MGMT_XCLBIN_IOCTL _IOW('k', 0, struct versl_mgmt_ioc_xclbin)
+
 struct vmr_drvdata;
+
+static dev_t devt_major;
+struct class *dev_class;
+
+struct vmr_char {
+	struct vmr_drvdata *vmr;
+	struct cdev cdev;
+	struct device *cdev_device;
+};
 
 struct vmr_cmd {
 	struct xgq_cmd_sq	xgq_cmd_entry;
@@ -190,6 +213,7 @@ struct comms_chan {
 
 struct vmr_drvdata {
 	struct pci_dev		*pdev;
+	struct vmr_char		char_dev;
 	struct xgq		xgq_queue;
 	u64			xgq_io_hdl;
 	void __iomem		*xgq_payload_base;
@@ -689,7 +713,7 @@ static int vmr_transfer_data(struct vmr_drvdata *vmr, const void *buf, u32 len, 
 {
 	struct vmr_cmd *cmd = NULL;
 	int id = 0;
-	int ret;
+	int ret = 0;
 
 	if (valid_data_opcode(opcode)) {
 		VMR_WARN(vmr, "unsupported opcode %d", opcode);
@@ -733,12 +757,12 @@ done:
 	return ret;
 }
 
-static int vmr_download_apu_bin(struct vmr_drvdata *vmr, char *buf, size_t len)
+static int vmr_transfer_data_impl(struct vmr_drvdata *vmr, char *buf, size_t len,
+				  enum xgq_cmd_opcode opcode)
 {
 	int ret;
 
-	ret = vmr_transfer_data(vmr, buf, (u32)len, 0, XGQ_CMD_OP_LOAD_APUBIN,
-				XGQ_DOWNLOAD_TIME);
+	ret = vmr_transfer_data(vmr, buf, (u32)len, 0, opcode, XGQ_DOWNLOAD_TIME);
 	if (ret != len) {
 		VMR_ERR(vmr, "ret: %d, buf request: %ld", ret, len);
 		return -EIO;
@@ -746,6 +770,16 @@ static int vmr_download_apu_bin(struct vmr_drvdata *vmr, char *buf, size_t len)
 
 	VMR_INFO(vmr, "successfully download len %ld", len);
 	return 0;
+}
+
+static int vmr_download_xclbin(struct vmr_drvdata *vmr, char *buf, size_t len)
+{
+	return vmr_transfer_data_impl(vmr, buf, len, XGQ_CMD_OP_LOAD_XCLBIN);
+}
+
+static int vmr_download_apu_bin(struct vmr_drvdata *vmr, char *buf, size_t len)
+{
+	return vmr_transfer_data_impl(vmr, buf, len, XGQ_CMD_OP_LOAD_APUBIN);
 }
 
 static void vmr_cq_result_copy(struct vmr_drvdata *vmr, struct vmr_cmd *cmd)
@@ -1124,11 +1158,151 @@ static int comms_chan_init(struct vmr_drvdata *vmr)
 	return 0;
 }
 
+static int vmr_char_open(struct inode *inode, struct file *filep)
+{
+	struct cdev *icdev = inode->i_cdev;
+	struct vmr_char *vmr_char = container_of(icdev, struct vmr_char, cdev);
+	struct vmr_drvdata *vmr = vmr_char->vmr;
+
+	if (!vmr) {
+		pr_err("vmr device not found\n");
+		return -ENXIO;
+	}
+	VMR_DBG(vmr, "vmr char device found");
+	filep->private_data = vmr;
+
+	return 0;
+}
+
+static int vmr_char_close(struct inode *inode, struct file *filep)
+{
+	filep->private_data = NULL;
+	return 0;
+}
+
+static long vmr_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
+{
+	struct vmr_drvdata *vmr = (struct vmr_drvdata *)filep->private_data;
+	struct versal_mgmt_ioc_xclbin ioc_obj = { 0 };
+	struct axlf xclbin = { 0 };
+	void *copy_buffer = NULL;
+	size_t copy_buffer_size = 0;
+	int ret = 0;
+
+	if (!vmr) {
+		pr_err("vmr device not found\n");
+		return -ENXIO;
+	}
+
+	ret = copy_from_user((void *)&ioc_obj, (void *)arg, sizeof(ioc_obj));
+	if (ret) {
+		VMR_ERR(vmr, "copy ioc_obj failed: %d\n", ret);
+		return ret;
+	}
+
+	ret = copy_from_user((void *)&xclbin, ioc_obj.xclbin, sizeof(xclbin));
+	if (ret) {
+		VMR_ERR(vmr, "copy xclbin failed: %d\n", ret);
+		return ret;
+	}
+	if (memcmp(xclbin.m_magic, ICAP_XCLBIN_V2, sizeof(ICAP_XCLBIN_V2)))
+		return -EINVAL;
+
+	copy_buffer_size = (size_t)xclbin.m_header.m_length;
+	/* xclbin should never be over 1G and less than size of struct axlf */
+	if (copy_buffer_size < sizeof(xclbin) || copy_buffer_size > 1024 * 1024 * 1024)
+		return -EINVAL;
+
+	copy_buffer = vmalloc(copy_buffer_size);
+	if (!copy_buffer)
+		return -ENOMEM;
+
+	ret = copy_from_user((void *)copy_buffer, ioc_obj.xclbin, copy_buffer_size);
+	if (ret) {
+		vfree(copy_buffer);
+		return -EFAULT;
+	}
+
+	ret = vmr_download_xclbin(vmr, (char *)copy_buffer, copy_buffer_size);
+
+	vfree(copy_buffer);
+
+	VMR_DBG(vmr, "received ioctl data ");
+
+	return ret;
+}
+
+static const struct file_operations fops = {
+	.owner = THIS_MODULE,
+	.open = vmr_char_open,
+	.release = vmr_char_close,
+	.unlocked_ioctl = vmr_ioctl,
+};
+
+static void vmr_char_destroy(struct vmr_drvdata *vmr)
+{
+	struct vmr_char *vmr_char = &vmr->char_dev;
+
+	device_destroy(dev_class, devt_major);
+	class_destroy(dev_class);
+	unregister_chrdev_region(devt_major, 1);
+
+	cdev_del(&vmr_char->cdev);
+}
+
+static int vmr_char_create(struct vmr_drvdata *vmr)
+{
+	struct vmr_char *vmr_char = &vmr->char_dev;
+	int ret;
+
+	if (alloc_chrdev_region(&devt_major, 0, 1, DRV_NAME) < 0)
+		return -EIO;
+
+	cdev_init(&vmr_char->cdev, &fops);
+	vmr_char->cdev.owner = THIS_MODULE;
+
+	ret = cdev_add(&vmr_char->cdev, devt_major, 1);
+	if (ret) {
+		pr_info("cdev_add %d\n", ret);
+		goto free_devt_major;
+	}
+
+	dev_class = class_create("versal mgmt char driver class");
+	if (IS_ERR(dev_class)) {
+		pr_info("create class %ld\n", PTR_ERR(dev_class));
+		goto free_cdev;
+	}
+
+	vmr_char->cdev_device = device_create(dev_class, NULL, MKDEV(MAJOR(devt_major), 0),
+					      NULL, "%s", DRV_NAME);
+	if (IS_ERR(vmr_char->cdev_device)) {
+		pr_info("device create %ld\n", PTR_ERR(vmr_char->cdev_device));
+		goto free_class;
+	}
+
+	vmr_char->vmr = vmr;
+
+	VMR_INFO(vmr, "succeeded");
+
+	return 0;
+free_class:
+	class_destroy(dev_class);
+
+free_cdev:
+	kobject_put(&vmr_char->cdev.kobj);
+
+free_devt_major:
+	unregister_chrdev_region(devt_major, 1);
+
+	return -EIO;
+}
+
 static void versal_mgmt_remove(struct pci_dev *pdev)
 {
 	struct vmr_drvdata *vmr = pci_get_drvdata(pdev);
 
 	comms_chan_finish(vmr);
+	vmr_char_destroy(vmr);
 	vmr_stop_services(vmr);
 	fini_worker(&vmr->xgq_complete_worker);
 	idr_destroy(&vmr->xgq_vmr_cid_idr);
@@ -1202,6 +1376,12 @@ static int versal_mgmt_probe(struct pci_dev *pdev,
 	}
 
 	pci_set_drvdata(pdev, vmr);
+
+	ret = vmr_char_create(vmr);
+	if (ret) {
+		VMR_ERR(vmr, "char create failed");
+		return ret;
+	}
 
 	VMR_INFO(vmr, "succeeded");
 
