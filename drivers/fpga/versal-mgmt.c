@@ -230,6 +230,7 @@ struct vmr_drvdata {
 	struct semaphore	xgq_log_page_sema;
 	struct xgq_cmd_cq_default_payload xgq_cq_payload;
 	bool			xgq_vmr_program;
+	uuid_t			xclbin_uuid;
 	void __iomem		*comms_chan_base;
 	struct comms_chan	comms;
 };
@@ -996,13 +997,11 @@ static int vmr_services_probe(struct vmr_drvdata *vmr)
 	return 0;
 }
 
-u32 comms_chan_get_xclbin_uuid(void *payload)
+u32 comms_chan_get_xclbin_uuid(struct vmr_drvdata *vmr, void *payload)
 {
 	struct comms_srv_uuid_resp *resp = (struct comms_srv_uuid_resp *)payload;
 
-	/* UUID of verify.xclbin */
-	resp->uuid = UUID_INIT(0xe35795bd, 0x5b08, 0x78d4, 0x4d, 0xc4, 0xdb,
-			       0x18, 0x81, 0x15, 0x9e, 0xc2);
+	uuid_copy(&resp->uuid, &vmr->xclbin_uuid);
 
 	return sizeof(*resp);
 }
@@ -1029,7 +1028,7 @@ void comms_chan_send_response(struct comms_chan *comms, struct comms_msg *msg)
 		size = comms_chan_get_protocol_version(response.body.payload);
 		break;
 	case COMMS_REQ_OPS_GET_XCLBIN_UUID:
-		size = comms_chan_get_xclbin_uuid(response.body.payload);
+		size = comms_chan_get_xclbin_uuid(comms->vmr, response.body.payload);
 		break;
 	default:
 		VMR_ERR(comms->vmr, "Unsupported request opcode: %d",
@@ -1224,6 +1223,12 @@ static long vmr_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 	}
 
 	ret = vmr_download_xclbin(vmr, (char *)copy_buffer, copy_buffer_size);
+	if (ret) {
+		VMR_ERR(vmr, "failed to download xclbin");
+		return ret;
+	}
+
+	uuid_copy(&vmr->xclbin_uuid, &xclbin.m_header.uuid);
 
 	vfree(copy_buffer);
 
