@@ -206,7 +206,7 @@ struct comms_msg {
 
 struct comms_chan {
 	struct vmr_drvdata	*vmr;
-	struct mutex		lock;
+	struct mutex		lock; /* to protect comms channel data */
 	struct timer_list	timer;
 	struct work_struct	work;
 };
@@ -773,6 +773,11 @@ static int vmr_transfer_data_impl(struct vmr_drvdata *vmr, char *buf, size_t len
 	return 0;
 }
 
+static int vmr_download_pdi(struct vmr_drvdata *vmr, char *buf, size_t len)
+{
+	return vmr_transfer_data_impl(vmr, buf, len, XGQ_CMD_OP_DOWNLOAD_PDI);
+}
+
 static int vmr_download_xclbin(struct vmr_drvdata *vmr, char *buf, size_t len)
 {
 	return vmr_transfer_data_impl(vmr, buf, len, XGQ_CMD_OP_LOAD_XCLBIN);
@@ -1006,7 +1011,6 @@ u32 comms_chan_get_xclbin_uuid(struct vmr_drvdata *vmr, void *payload)
 	return sizeof(*resp);
 }
 
-
 u32 comms_chan_get_protocol_version(void *payload)
 {
 	struct comms_srv_ver_resp *resp = (struct comms_srv_ver_resp *)payload;
@@ -1098,7 +1102,6 @@ void comms_chan_check_request(struct work_struct *w)
 
 exit:
 	mutex_unlock(&comms->lock);
-	return;
 }
 
 void comms_chan_sched_work(struct timer_list *t)
@@ -1133,7 +1136,7 @@ static int comms_chan_init(struct vmr_drvdata *vmr)
 	/* Clear request and response FIFOs */
 	iowrite32(0x3, vmr->comms_chan_base + COMMS_REG_CTRL_OFF);
 
-	/* Disble interrupts */
+	/* Disable interrupts */
 	iowrite32(0, vmr->comms_chan_base + COMMS_REG_IE_OFF);
 
 	/* Clear interrupts */
@@ -1237,11 +1240,48 @@ static long vmr_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 	return ret;
 }
 
+static long vmr_ospi_write(struct file *filep, const char __user *udata, size_t data_len, loff_t *off)
+{
+	ssize_t ret = 0;
+	char *kdata = NULL;
+	struct vmr_drvdata *vmr = (struct vmr_drvdata *)filep->private_data;
+	/* TO DO:- Add check for offset controlled by user to return -EINVAL on non zero offset*/
+	if (!vmr) {
+		pr_err("vmr device not found\n");
+		return -ENXIO;
+	}
+
+	if (data_len == 0) {
+		VMR_ERR(vmr, "OSPI data length cannot be zero");
+		return -EINVAL;
+	}
+
+	kdata = vmalloc(data_len);
+	if (!kdata) {
+		VMR_ERR(vmr, "Kernel Memory allocation failure");
+		ret = -ENOMEM;
+		goto done;
+	}
+
+	ret = copy_from_user((void *)kdata, udata, data_len);
+	if (ret) {
+		VMR_ERR(vmr, "Copy from user to kernel space failed %ld", ret);
+		goto done;
+	}
+
+	/* TO DO:- Add Program VMR opcode */
+	ret = vmr_download_pdi(vmr, (char *)kdata, data_len);
+done:
+	vfree(kdata);
+	return ret;
+}
+
 static const struct file_operations fops = {
 	.owner = THIS_MODULE,
 	.open = vmr_char_open,
 	.release = vmr_char_close,
 	.unlocked_ioctl = vmr_ioctl,
+	.write = vmr_ospi_write,
 };
 
 static void vmr_char_destroy(struct vmr_drvdata *vmr)
