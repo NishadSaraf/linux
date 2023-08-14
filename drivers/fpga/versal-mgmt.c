@@ -15,6 +15,7 @@
 #include <linux/delay.h>
 #include <linux/kthread.h>
 #include <linux/firmware.h>
+#include <linux/fpga/fpga-mgr.h>
 #include <linux/timer.h>
 #include <linux/jiffies.h>
 #include <linux/workqueue.h>
@@ -23,7 +24,6 @@
 #include <linux/fs.h>
 #include <linux/cdev.h>
 #include <linux/module.h>
-#include <linux/miscdevice.h>
 
 #include "xgq_cmd_vmr.h"
 #include "xgq_xocl_plat.h"
@@ -100,7 +100,8 @@ struct versal_mgmt_ioc_xclbin {
 	char *xclbin;
 };
 
-#define VERSAL_MGMT_XCLBIN_IOCTL _IOW('k', 0, struct versl_mgmt_ioc_xclbin)
+#define VERSAL_MGMT_LOAD_XCLBIN_IOCTL	_IOW('k', 0, struct versal_mgmt_ioc_xclbin)
+#define VERSAL_MGMT_PROGRAM_SHELL_IOCTL	_IOW('k', 1, struct versal_mgmt_ioc_xclbin)
 
 struct vmr_drvdata;
 
@@ -211,6 +212,12 @@ struct comms_chan {
 	struct work_struct	work;
 };
 
+struct vmr_fw_tnx {
+	struct vmr_cmd		*cmd;
+	enum xgq_cmd_opcode	opcode;
+	int			id;
+};
+
 struct vmr_drvdata {
 	struct pci_dev		*pdev;
 	struct vmr_char		char_dev;
@@ -233,6 +240,10 @@ struct vmr_drvdata {
 	uuid_t			xclbin_uuid;
 	void __iomem		*comms_chan_base;
 	struct comms_chan	comms;
+
+	struct fpga_manager	*mgr;
+	enum fpga_mgr_states	state;
+	struct vmr_fw_tnx	fw_tnx;
 };
 
 static const struct pci_device_id versal_mgmt_id_tbl[] = {
@@ -773,16 +784,6 @@ static int vmr_transfer_data_impl(struct vmr_drvdata *vmr, char *buf, size_t len
 	return 0;
 }
 
-static int vmr_download_pdi(struct vmr_drvdata *vmr, char *buf, size_t len)
-{
-	return vmr_transfer_data_impl(vmr, buf, len, XGQ_CMD_OP_DOWNLOAD_PDI);
-}
-
-static int vmr_download_xclbin(struct vmr_drvdata *vmr, char *buf, size_t len)
-{
-	return vmr_transfer_data_impl(vmr, buf, len, XGQ_CMD_OP_LOAD_XCLBIN);
-}
-
 static int vmr_download_apu_bin(struct vmr_drvdata *vmr, char *buf, size_t len)
 {
 	return vmr_transfer_data_impl(vmr, buf, len, XGQ_CMD_OP_LOAD_APUBIN);
@@ -1189,12 +1190,9 @@ static long vmr_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 	struct axlf xclbin = { 0 };
 	void *copy_buffer = NULL;
 	size_t copy_buffer_size = 0;
+	struct fpga_manager *mgr;
+	struct fpga_image_info *info;
 	int ret = 0;
-
-	if (!vmr) {
-		pr_err("vmr device not found\n");
-		return -ENXIO;
-	}
 
 	ret = copy_from_user((void *)&ioc_obj, (void *)arg, sizeof(ioc_obj));
 	if (ret) {
@@ -1211,6 +1209,7 @@ static long vmr_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 		return -EINVAL;
 
 	copy_buffer_size = (size_t)xclbin.m_header.m_length;
+
 	/* xclbin should never be over 1G and less than size of struct axlf */
 	if (copy_buffer_size < sizeof(xclbin) || copy_buffer_size > 1024 * 1024 * 1024)
 		return -EINVAL;
@@ -1225,54 +1224,53 @@ static long vmr_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 		return -EFAULT;
 	}
 
-	ret = vmr_download_xclbin(vmr, (char *)copy_buffer, copy_buffer_size);
-	if (ret) {
-		VMR_ERR(vmr, "failed to download xclbin");
-		return ret;
-	}
-
-	uuid_copy(&vmr->xclbin_uuid, &xclbin.m_header.uuid);
-
-	vfree(copy_buffer);
-
-	VMR_DBG(vmr, "received ioctl data ");
-
-	return ret;
-}
-
-static long vmr_ospi_write(struct file *filep, const char __user *udata, size_t data_len, loff_t *off)
-{
-	ssize_t ret = 0;
-	char *kdata = NULL;
-	struct vmr_drvdata *vmr = (struct vmr_drvdata *)filep->private_data;
-	/* TO DO:- Add check for offset controlled by user to return -EINVAL on non zero offset*/
-	if (!vmr) {
-		pr_err("vmr device not found\n");
-		return -ENXIO;
-	}
-
-	if (data_len == 0) {
-		VMR_ERR(vmr, "OSPI data length cannot be zero");
+	switch (cmd) {
+	case VERSAL_MGMT_LOAD_XCLBIN_IOCTL:
+		vmr->fw_tnx.opcode = XGQ_CMD_OP_LOAD_XCLBIN;
+		break;
+	case VERSAL_MGMT_PROGRAM_SHELL_IOCTL:
+		vmr->fw_tnx.opcode = XGQ_CMD_OP_DOWNLOAD_PDI;
+		break;
+	default:
+		VMR_ERR(vmr, "Invalid IOCTL command: %d", cmd);
 		return -EINVAL;
 	}
 
-	kdata = vmalloc(data_len);
-	if (!kdata) {
-		VMR_ERR(vmr, "Kernel Memory allocation failure");
+	mgr = fpga_mgr_get(&vmr->pdev->dev);
+	if (IS_ERR(mgr)) {
+		ret = PTR_ERR(mgr);
+		goto exit4;
+	}
+
+	ret = fpga_mgr_lock(mgr);
+	if (ret)
+		goto exit3;
+
+	info = fpga_image_info_alloc(&vmr->pdev->dev);
+	if (!info) {
 		ret = -ENOMEM;
-		goto done;
+		goto exit2;
 	}
 
-	ret = copy_from_user((void *)kdata, udata, data_len);
+	info->buf = copy_buffer;
+	info->count = copy_buffer_size;
+
+	ret = fpga_mgr_load(mgr, info);
 	if (ret) {
-		VMR_ERR(vmr, "Copy from user to kernel space failed %ld", ret);
-		goto done;
+		goto exit1;
 	}
 
-	/* TO DO:- Add Program VMR opcode */
-	ret = vmr_download_pdi(vmr, (char *)kdata, data_len);
-done:
-	vfree(kdata);
+	VMR_INFO(vmr, "Downloaded firmware %pUb of size %zu bytes",
+			&xclbin.m_header.uuid, copy_buffer_size);
+	uuid_copy(&vmr->xclbin_uuid, &xclbin.m_header.uuid);
+exit1:
+	fpga_image_info_free(info);
+exit2:
+	fpga_mgr_unlock(mgr);
+exit3:
+	fpga_mgr_put(mgr);
+exit4:
+	vfree(copy_buffer);
 	return ret;
 }
 
@@ -1281,7 +1279,6 @@ static const struct file_operations fops = {
 	.open = vmr_char_open,
 	.release = vmr_char_close,
 	.unlocked_ioctl = vmr_ioctl,
-	.write = vmr_ospi_write,
 };
 
 static void vmr_char_destroy(struct vmr_drvdata *vmr)
@@ -1341,6 +1338,96 @@ free_devt_major:
 
 	return -EIO;
 }
+
+static int versal_fpga_write_init(struct fpga_manager *mgr,
+				  struct fpga_image_info *info, const char *buf,
+				  size_t count)
+{
+	struct vmr_drvdata *vmr = mgr->priv;
+	struct vmr_fw_tnx *tnx = &vmr->fw_tnx;
+	int ret;
+
+	ret = vmr_create_cmd(vmr, tnx->opcode, &tnx->cmd, &tnx->id,
+			     XGQ_DOWNLOAD_TIME);
+	if (ret) {
+		vmr->state = FPGA_MGR_STATE_WRITE_INIT_ERR;
+		return ret;
+	}
+
+	vmr->state = FPGA_MGR_STATE_WRITE_INIT;
+	return ret;
+}
+
+static int versal_fpga_write(struct fpga_manager *mgr,
+			 const char *buf, size_t count)
+{
+	struct vmr_drvdata *vmr = mgr->priv;
+	u64 priv = 0;
+	int ret;
+
+	ret = vmr_data_payload_init(vmr, vmr->fw_tnx.cmd, vmr->fw_tnx.opcode,
+				    buf, count, priv);
+	if (ret) {
+		vmr->state = FPGA_MGR_STATE_WRITE_ERR;
+		vmr_remove_cmd(vmr, vmr->fw_tnx.cmd, vmr->fw_tnx.id);
+		return ret;
+	}
+
+	vmr->state = FPGA_MGR_STATE_WRITE;
+	return 0;
+}
+
+static int versal_fpga_write_complete(struct fpga_manager *mgr,
+				  struct fpga_image_info *info)
+{
+	struct vmr_drvdata *vmr = mgr->priv;
+	int ret;
+
+	ret = vmr_submit_cmd(vmr, vmr->fw_tnx.cmd);
+	if (ret) {
+		vmr->state = FPGA_MGR_STATE_WRITE_COMPLETE_ERR;
+		VMR_ERR(vmr, "submit cmd failed, cid %d", vmr->fw_tnx.id);
+		goto done;
+	}
+
+	/*
+	 * For pdi/xclbin data transfer, we block any cancellation and
+	 * wait till command completed and then release resources safely.
+	 * We call cond_resched after every timeout to avoid linux kernel
+	 * warning for thread hanging too long.
+	 */
+	while (!wait_for_completion_timeout(&vmr->fw_tnx.cmd->xgq_cmd_complete,
+					    XGQ_WAIT_TIMEOUT))
+		cond_resched();
+
+	if (vmr->fw_tnx.cmd->xgq_cmd_rcode) {
+		ret = -ETIMEDOUT;
+		vmr->state = FPGA_MGR_STATE_WRITE_COMPLETE_ERR;
+		goto done;
+	}
+
+	vmr->state = FPGA_MGR_STATE_WRITE_COMPLETE;
+done:
+	vmr_data_payload_fini(vmr);
+	vmr_remove_cmd(vmr, vmr->fw_tnx.cmd, vmr->fw_tnx.id);
+	memset(&vmr->fw_tnx, 0, sizeof(vmr->fw_tnx));
+	return ret;
+}
+
+static enum fpga_mgr_states versal_fpga_state(struct fpga_manager *mgr)
+{
+	struct vmr_drvdata *vmr = mgr->priv;
+
+	return vmr->state;
+}
+
+
+static const struct fpga_manager_ops versal_fpga_ops = {
+	.write_init = versal_fpga_write_init,
+	.write = versal_fpga_write,
+	.write_complete = versal_fpga_write_complete,
+	.state = versal_fpga_state,
+};
 
 static void versal_mgmt_remove(struct pci_dev *pdev)
 {
@@ -1427,6 +1514,12 @@ static int versal_mgmt_probe(struct pci_dev *pdev,
 		VMR_ERR(vmr, "char create failed");
 		return ret;
 	}
+
+	/* register fpga manager */
+	vmr->mgr = devm_fpga_mgr_register(&pdev->dev, "AMD Versal FPGA Manager",
+				     &versal_fpga_ops, vmr);
+	if (IS_ERR(vmr->mgr))
+		return PTR_ERR(vmr->mgr);
 
 	VMR_INFO(vmr, "succeeded");
 
