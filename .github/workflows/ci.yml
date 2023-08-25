@@ -1,0 +1,52 @@
+name: CI Pipeline
+
+on:
+    push:
+      branches: [ "vmgmt" ]
+    pull_request:
+      branches: [ "vmgmt" ]
+
+jobs:
+  build:
+    name: Build
+    runs-on: [ self-hosted ]
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Setup build environment
+      run: |
+        make distclean
+        make x86_64_versal_defconfig
+
+    - name: Build base kernel
+      run: make -j 3
+
+    - name: Enable Versal Management LKM
+      run: ./scripts/config --enable FPGA_MGR_VERSAL_MGMT
+
+    - name: Compile
+      run: |
+        make M=drivers/fpga clean
+        make M=drivers/fpga
+
+  lint:
+    name: Lint
+    needs: build
+    runs-on: [ self-hosted ]
+    continue-on-error: true
+
+    steps:
+    - name: Check source
+      run: |
+        ./scripts/checkpatch.pl -f --strict drivers/fpga/versal-mgmt.c
+        ./scripts/checkpatch.pl -f --strict drivers/fpga/xgq*.h
+        ./scripts/checkpatch.pl -f --strict drivers/fpga/xclbin.h
+
+    - name: Check documentation
+      run: |
+        ./scripts/kernel-doc -none -v drivers/fpga/versal-mgmt.c
+        ./scripts/kernel-doc -none -v drivers/fpga/xgq*.h
+        ./scripts/kernel-doc -none -v drivers/fpga/xclbin.h
+
