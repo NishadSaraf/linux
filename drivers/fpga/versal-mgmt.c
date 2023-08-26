@@ -3,10 +3,7 @@
  * Driver for Versal PCIe device
  *
  * Copyright (C) 2023 AMD Corporation, Inc.
- *
- * Authors:
  */
-
 #include <linux/bitfield.h>
 #include <linux/pci.h>
 #include <linux/types.h>
@@ -75,6 +72,7 @@
 #define COMMS_REG_CTRL_OFF	0x2C
 
 #define MAX_WAIT		30
+
 /*
  * Shared memory layout
  * ------------------- 0x0
@@ -84,17 +82,17 @@
  *  ...
  * -------------------
  */
-#define VMR_LOG_PAGE_SIZE	(1024 * 1024)
-#define VMR_LOG_PAGE_NUM	1
-#define VMR_LOG_ADDR_OFF	0x0
-#define VMR_DATA_ADDR_OFF	(VMR_LOG_PAGE_SIZE * VMR_LOG_PAGE_NUM)
+#define VMR_LOG_PAGE_SIZE		(1024 * 1024)
+#define VMR_LOG_PAGE_NUM		1
+#define VMR_LOG_ADDR_OFF		0x0
+#define VMR_DATA_ADDR_OFF		(VMR_LOG_PAGE_SIZE * VMR_LOG_PAGE_NUM)
 
-#define VMR_INFO(vmr, fmt, args...)  dev_info(&(vmr)->pdev->dev, "%s: "fmt, __func__, ##args)
-#define VMR_WARN(vmr, fmt, args...)  dev_warn(&(vmr)->pdev->dev, "%s: "fmt, __func__, ##args)
-#define VMR_ERR(vmr, fmt, args...)   dev_err(&(vmr)->pdev->dev, "%s: "fmt, __func__, ##args)
-#define VMR_DBG(vmr, fmt, args...)   dev_dbg(&(vmr)->pdev->dev, "%s: "fmt, __func__, ##args)
+#define VMR_INFO(vmr, fmt, args...)	dev_info(&(vmr)->pdev->dev, "%s: "fmt, __func__, ##args)
+#define VMR_WARN(vmr, fmt, args...)	dev_warn(&(vmr)->pdev->dev, "%s: "fmt, __func__, ##args)
+#define VMR_ERR(vmr, fmt, args...)	dev_err(&(vmr)->pdev->dev, "%s: "fmt, __func__, ##args)
+#define VMR_DBG(vmr, fmt, args...)	dev_dbg(&(vmr)->pdev->dev, "%s: "fmt, __func__, ##args)
 
-#define ICAP_XCLBIN_V2          "xclbin2"
+#define ICAP_XCLBIN_V2			"xclbin2"
 
 struct versal_mgmt_ioc_xclbin {
 	char *xclbin;
@@ -1256,12 +1254,11 @@ static long vmr_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 	info->count = copy_buffer_size;
 
 	ret = fpga_mgr_load(mgr, info);
-	if (ret) {
+	if (ret)
 		goto exit1;
-	}
 
 	VMR_INFO(vmr, "Downloaded firmware %pUb of size %zu bytes",
-			&xclbin.m_header.uuid, copy_buffer_size);
+		 &xclbin.m_header.uuid, copy_buffer_size);
 	uuid_copy(&vmr->xclbin_uuid, &xclbin.m_header.uuid);
 exit1:
 	fpga_image_info_free(info);
@@ -1358,8 +1355,8 @@ static int versal_fpga_write_init(struct fpga_manager *mgr,
 	return ret;
 }
 
-static int versal_fpga_write(struct fpga_manager *mgr,
-			 const char *buf, size_t count)
+static int versal_fpga_write(struct fpga_manager *mgr, const char *buf,
+			     size_t count)
 {
 	struct vmr_drvdata *vmr = mgr->priv;
 	u64 priv = 0;
@@ -1378,7 +1375,7 @@ static int versal_fpga_write(struct fpga_manager *mgr,
 }
 
 static int versal_fpga_write_complete(struct fpga_manager *mgr,
-				  struct fpga_image_info *info)
+				      struct fpga_image_info *info)
 {
 	struct vmr_drvdata *vmr = mgr->priv;
 	int ret;
@@ -1420,7 +1417,6 @@ static enum fpga_mgr_states versal_fpga_state(struct fpga_manager *mgr)
 
 	return vmr->state;
 }
-
 
 static const struct fpga_manager_ops versal_fpga_ops = {
 	.write_init = versal_fpga_write_init,
@@ -1517,7 +1513,7 @@ static int versal_mgmt_probe(struct pci_dev *pdev,
 
 	/* register fpga manager */
 	vmr->mgr = devm_fpga_mgr_register(&pdev->dev, "AMD Versal FPGA Manager",
-				     &versal_fpga_ops, vmr);
+					  &versal_fpga_ops, vmr);
 	if (IS_ERR(vmr->mgr))
 		return PTR_ERR(vmr->mgr);
 
