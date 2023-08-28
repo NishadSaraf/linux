@@ -17,11 +17,13 @@ jobs:
 
     - name: Setup build environment
       run: |
-        make distclean
         make x86_64_versal_defconfig
 
     - name: Build base kernel
-      run: make -j 3
+      run: |
+        make -j 3
+        make modules_install
+        make headers_install
 
     - name: Enable Versal Management LKM
       run: ./scripts/config --enable FPGA_MGR_VERSAL_MGMT
@@ -29,7 +31,7 @@ jobs:
     - name: Compile
       run: |
         make M=drivers/fpga clean
-        make M=drivers/fpga
+        make M=drivers/fpga -j 3
 
   lint:
     name: Lint
@@ -49,4 +51,17 @@ jobs:
         ./scripts/kernel-doc -none -v drivers/fpga/versal-mgmt.c
         ./scripts/kernel-doc -none -v drivers/fpga/xgq*.h
         ./scripts/kernel-doc -none -v drivers/fpga/xclbin.h
+
+  test:
+    name: Test
+    needs: build
+    runs-on: [ self-hosted ]
+
+    steps:
+    - name: Modprobe versal_mgmt
+      run: |
+        modprobe versal_mgmt
+        dmesg | tail -10
+        modprobe -r versal_mgmt
+        dmesg | tail -10
 
