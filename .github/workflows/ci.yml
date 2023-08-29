@@ -17,24 +17,10 @@ jobs:
 
     - name: Setup build environment
       run: |
-        sudo make x86_64_versal_defconfig
+        sudo ccache -sv
+        sudo make CC="ccache gcc" x86_64_versal_defconfig
 
-    - name: Get kernel version
-      id: get-kversion
-      run: echo "kversion=$(/bin/uname -r)" >> $GITHUB_OUTPUT
-      shell: bash
-
-    - name: Install cached kernel build
-      id: cache-kernel
-      uses: actions/cache@v3
-      with:
-        # ccache files are stored in '~/.cache/ccache'
-        path: ~/.cache/ccache
-        key: kernel-${{ steps.get-kversion.outputs.kversion }}-${{ hashFiles('**/arch/x86/configs/x86_64_versal_defconfig') }}
-        restore-keys: kernel-
-
-    - if: steps.cache-kernel-outputs.cache-hit != 'true'
-      name: Build base kernel
+    - name: Build base kernel
       run: |
         time KBUILD_BUILD_TIMESTAMP='' sudo make CC="ccache gcc" -j 3
         sudo make modules_install
@@ -45,8 +31,9 @@ jobs:
 
     - name: Compile
       run: |
-        make M=drivers/fpga clean
-        time KBUILD_BUILD_TIMESTAMP='' make M=drivers/fpga CC="ccache gcc" -j 3
+        sudo make M=drivers/fpga clean
+        time KBUILD_BUILD_TIMESTAMP='' sudo make M=drivers/fpga CC="ccache gcc" -j 3
+        sudo ccache -sv
 
   lint:
     name: Lint
