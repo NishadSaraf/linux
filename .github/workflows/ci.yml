@@ -17,13 +17,28 @@ jobs:
 
     - name: Setup build environment
       run: |
-        make x86_64_versal_defconfig
+        sudo make x86_64_versal_defconfig
 
-    - name: Build base kernel
+    - name: Get kernel version
+      id: get-kversion
+      run: echo "kversion=$(/bin/uname -r)" >> $GITHUB_OUTPUT
+      shell: bash
+
+    - name: Install cached kernel build
+      id: cache-kernel
+      uses: actions/cache@v3
+      with:
+        # ccache files are stored in '~/.cache/ccache'
+        path: ~/.cache/ccache
+        key: kernel-${{ steps.get-kversion.outputs.kversion }}-${{ hashFiles('**/arch/x86/configs/x86_64_versal_defconfig') }}
+        restore-keys: kernel-
+
+    - if: steps.cache-kernel-outputs.cache-hit != 'true'
+      name: Build base kernel
       run: |
-        make -j 3
-        make modules_install
-        make headers_install
+        time KBUILD_BUILD_TIMESTAMP='' sudo make CC="ccache gcc" -j 3
+        sudo make modules_install
+        sudo make headers_install
 
     - name: Enable Versal Management LKM
       run: ./scripts/config --enable FPGA_MGR_VERSAL_MGMT
@@ -31,7 +46,7 @@ jobs:
     - name: Compile
       run: |
         make M=drivers/fpga clean
-        make M=drivers/fpga -j 3
+        time KBUILD_BUILD_TIMESTAMP='' make M=drivers/fpga CC="ccache gcc" -j 3
 
   lint:
     name: Lint
@@ -60,8 +75,8 @@ jobs:
     steps:
     - name: Modprobe versal_mgmt
       run: |
-        modprobe versal_mgmt
+        sudo modprobe versal_mgmt
         dmesg | tail -10
-        modprobe -r versal_mgmt
+        sudo modprobe -r versal_mgmt
         dmesg | tail -10
 
