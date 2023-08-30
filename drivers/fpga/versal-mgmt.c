@@ -21,10 +21,10 @@
 #include <linux/fs.h>
 #include <linux/cdev.h>
 #include <linux/module.h>
+#include <linux/xclbin.h>
 
 #include "xgq_cmd_vmr.h"
 #include "xgq_xocl_plat.h"
-#include "xclbin.h"
 
 #define DRV_VERSION		"0.1"
 #define DRV_NAME		"versal-mgmt"
@@ -1203,10 +1203,10 @@ static long vmr_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 		VMR_ERR(vmr, "copy xclbin failed: %d\n", ret);
 		return ret;
 	}
-	if (memcmp(xclbin.m_magic, ICAP_XCLBIN_V2, sizeof(ICAP_XCLBIN_V2)))
+	if (memcmp(xclbin.magic, ICAP_XCLBIN_V2, sizeof(ICAP_XCLBIN_V2)))
 		return -EINVAL;
 
-	copy_buffer_size = (size_t)xclbin.m_header.m_length;
+	copy_buffer_size = (size_t)xclbin.header.length;
 
 	/* xclbin should never be over 1G and less than size of struct axlf */
 	if (copy_buffer_size < sizeof(xclbin) || copy_buffer_size > 1024 * 1024 * 1024)
@@ -1258,8 +1258,8 @@ static long vmr_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 		goto exit1;
 
 	VMR_INFO(vmr, "Downloaded firmware %pUb of size %zu bytes",
-		 &xclbin.m_header.uuid, copy_buffer_size);
-	uuid_copy(&vmr->xclbin_uuid, &xclbin.m_header.uuid);
+		 &xclbin.header.uuid, copy_buffer_size);
+	uuid_copy(&vmr->xclbin_uuid, &xclbin.header.uuid);
 exit1:
 	fpga_image_info_free(info);
 exit2:
