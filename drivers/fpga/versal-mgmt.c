@@ -236,6 +236,7 @@ struct vmr_drvdata {
 	struct xgq_cmd_cq_default_payload xgq_cq_payload;
 	bool			xgq_vmr_program;
 	uuid_t			xclbin_uuid;
+	uuid_t			intf_uuid;
 	void __iomem		*comms_chan_base;
 	struct comms_chan	comms;
 
@@ -1247,6 +1248,14 @@ static long vmr_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 
 	switch (cmd) {
 	case VERSAL_MGMT_LOAD_XCLBIN_IOCTL:
+		/* Check xclbin compatibility with the base shell */
+		if (!uuid_equal(&vmr->intf_uuid, &xclbin.header.rom_uuid)) {
+			VMR_ERR(vmr, "xclbin incompatible with base shell");
+			VMR_ERR(vmr, "xclbin interface UUID: %pU",
+				&xclbin.header.rom_uuid);
+			vfree(copy_buffer);
+			return -EINVAL;
+		}
 		vmr->fw_tnx.opcode = XGQ_CMD_OP_LOAD_XCLBIN;
 		break;
 	case VERSAL_MGMT_PROGRAM_SHELL_IOCTL:
@@ -1486,7 +1495,7 @@ static int xgq_log_page_fw(struct vmr_drvdata *vmr, char **fw, size_t *fw_size,
 	cmd->xgq_cmd_arg = cmd;
 	cmd->xgq_vmr = vmr;
 
-	hdr = &(cmd->xgq_cmd_entry.hdr);
+	hdr = &cmd->xgq_cmd_entry.hdr;
 	hdr->opcode = XGQ_CMD_OP_GET_LOG_PAGE;
 	hdr->state = XGQ_SQ_CMD_NEW;
 	hdr->count = sizeof(*payload);
@@ -1504,7 +1513,7 @@ static int xgq_log_page_fw(struct vmr_drvdata *vmr, char **fw, size_t *fw_size,
 	/* init condition veriable */
 	init_completion(&cmd->xgq_cmd_complete);
 
-	/* set timout actual jiffies */
+	/* set timeout actual jiffies */
 	cmd->xgq_cmd_timeout_jiffies = jiffies + XGQ_CONFIG_TIME;
 
 	if (shm_acquire_log_page(vmr, &address, &len)) {
@@ -1515,7 +1524,7 @@ static int xgq_log_page_fw(struct vmr_drvdata *vmr, char **fw, size_t *fw_size,
 	/* adjust requested len based on req_size */
 	len = (req_size && req_size < len) ? req_size : len;
 
-	payload = &(cmd->xgq_cmd_entry.log_payload);
+	payload = &cmd->xgq_cmd_entry.log_payload;
 	payload->address = address;
 	payload->size = len;
 	payload->offset = off;
@@ -1574,12 +1583,26 @@ static int vmr_get_intf_uuid(struct vmr_drvdata *vmr)
 	int ret = 0;
 	char *buf = NULL;
 	size_t size = 0;
+	char str[UUID_STRING_LEN];
+	u8 i, j;
 
 	ret = xgq_log_page_fw(vmr, &buf, &size,
 			      XGQ_CMD_LOG_SHELL_INTERFACE_UUID, 0, 0);
 	if (ret) {
 		VMR_INFO(vmr, "Failed to get intf uuid from vmr: %d", ret);
+		return ret;
 	}
+
+	/* parse uuid into a valid uuid string format */
+	for (i  = 0, j = 0; i < size; i++) {
+		str[j++] = buf[i];
+		if (j == 8 || j == 13 || j == 18 || j == 23)
+			str[j++] = '-';
+	}
+
+	VMR_INFO(vmr, "Interface uuid %s", str);
+
+	uuid_parse(str, &vmr->intf_uuid);
 
 	return ret;
 }
