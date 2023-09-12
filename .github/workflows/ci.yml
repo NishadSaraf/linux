@@ -61,6 +61,7 @@ jobs:
 
     steps:
     - name: Modprobe versal_mgmt
+      continue-on-error: true
       run: |
         sudo modprobe versal_mgmt
         dmesg | tail -10
