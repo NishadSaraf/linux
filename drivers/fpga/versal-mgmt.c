@@ -537,6 +537,29 @@ static void shm_release_data(struct vmr_drvdata *vmr)
 	up(&vmr->xgq_data_sema);
 }
 
+static u32 inline shm_addr_log_page(struct vmr_drvdata *vmr)
+{
+	return vmr->xgq_vmr_shared_mem.vmr_data_start + VMR_LOG_ADDR_OFF;
+}
+
+static int shm_acquire_log_page(struct vmr_drvdata *vmr, u32 *addr, u32 *len)
+{
+	if (down_interruptible(&vmr->xgq_log_page_sema)) {
+		VMR_ERR(vmr, "cancelled");
+		return -EIO;
+	}
+
+	/*TODO: memset shared memory to all zero */
+	*addr = shm_addr_log_page(vmr);
+	*len = VMR_LOG_PAGE_SIZE;
+	return 0;
+}
+
+static void shm_release_log_page(struct vmr_drvdata *vmr)
+{
+	up(&vmr->xgq_log_page_sema);
+}
+
 static void memcpy_to_device(struct vmr_drvdata *vmr, u32 offset, const void *data, size_t len)
 {
 	void __iomem *dst = vmr->xgq_payload_base + offset;
@@ -1442,6 +1465,125 @@ static void versal_mgmt_remove(struct pci_dev *pdev)
 	dev_info(&pdev->dev, "%s removed.\n", __func__);
 }
 
+static int xgq_log_page_fw(struct vmr_drvdata *vmr, char **fw, size_t *fw_size,
+			   enum xgq_cmd_log_page_type req_pid, loff_t off,
+			   size_t req_size)
+{
+	struct vmr_cmd *cmd = NULL;
+	struct xgq_cmd_log_payload *payload = NULL;
+	struct xgq_cmd_sq_hdr *hdr = NULL;
+	int ret = 0;
+	int id = 0;
+	u32 address = 0;
+	u32 len = 0;
+
+	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	if (!cmd) {
+		VMR_ERR(vmr, "kmalloc failed, retry");
+		return -ENOMEM;
+	}
+
+	cmd->xgq_cmd_arg = cmd;
+	cmd->xgq_vmr = vmr;
+
+	hdr = &(cmd->xgq_cmd_entry.hdr);
+	hdr->opcode = XGQ_CMD_OP_GET_LOG_PAGE;
+	hdr->state = XGQ_SQ_CMD_NEW;
+	hdr->count = sizeof(*payload);
+
+	mutex_lock(&vmr->xgq_lock);
+	id = idr_alloc_cyclic(&vmr->xgq_vmr_cid_idr, vmr, 0, 0, GFP_KERNEL);
+	mutex_unlock(&vmr->xgq_lock);
+	if (id < 0) {
+		VMR_ERR(vmr, "alloc cid failed: %d", id);
+		ret = -ENOMEM;
+		goto exit;
+	}
+	hdr->cid = id;
+
+	/* init condition veriable */
+	init_completion(&cmd->xgq_cmd_complete);
+
+	/* set timout actual jiffies */
+	cmd->xgq_cmd_timeout_jiffies = jiffies + XGQ_CONFIG_TIME;
+
+	if (shm_acquire_log_page(vmr, &address, &len)) {
+		ret = -EIO;
+		goto exit;
+	}
+
+	/* adjust requested len based on req_size */
+	len = (req_size && req_size < len) ? req_size : len;
+
+	payload = &(cmd->xgq_cmd_entry.log_payload);
+	payload->address = address;
+	payload->size = len;
+	payload->offset = off;
+	payload->pid = req_pid;
+
+	ret = vmr_submit_cmd(vmr, cmd);
+	if (ret) {
+		VMR_ERR(vmr, "submit cmd failed, cid %d", id);
+		goto done;
+	}
+
+	while (!wait_for_completion_timeout(&cmd->xgq_cmd_complete, XGQ_WAIT_TIMEOUT))
+		cond_resched();
+
+	ret = cmd->xgq_cmd_rcode;
+
+	if (ret) {
+		VMR_ERR(vmr, "intf uuid fetch failed ret %d", ret);
+	} else {
+		struct xgq_cmd_cq_log_page_payload *intf_uuid = NULL;
+
+		intf_uuid = (struct xgq_cmd_cq_log_page_payload *)&cmd->xgq_cmd_cq_payload;
+
+		if (intf_uuid->count > len) {
+			VMR_ERR(vmr, "need to alloc %d for device data",
+				intf_uuid->count);
+			ret = -ENOSPC;
+		} else if (intf_uuid->count == 0) {
+			VMR_WARN(vmr, "uuid size is zero");
+			ret = -EINVAL;
+		} else {
+			*fw_size = intf_uuid->count;
+			*fw = vmalloc(*fw_size);
+			if (*fw == NULL) {
+				VMR_ERR(vmr, "vmalloc failed");
+				ret = -ENOMEM;
+				goto done;
+			}
+			memcpy_from_device(vmr, address, *fw, *fw_size);
+			ret = 0;
+			VMR_INFO(vmr, "loading uuid from vmr size %ld",
+				 *fw_size);
+			VMR_INFO(vmr, "Interface uuid %s", *fw);
+		}
+	}
+
+done:
+	shm_release_log_page(vmr);
+exit:
+	vmr_remove_cmd(vmr, cmd, id);
+	return ret;
+}
+
+static int vmr_get_intf_uuid(struct vmr_drvdata *vmr)
+{
+	int ret = 0;
+	char *buf = NULL;
+	size_t size = 0;
+
+	ret = xgq_log_page_fw(vmr, &buf, &size,
+			      XGQ_CMD_LOG_SHELL_INTERFACE_UUID, 0, 0);
+	if (ret) {
+		VMR_INFO(vmr, "Failed to get intf uuid from vmr: %d", ret);
+	}
+
+	return ret;
+}
+
 static int versal_mgmt_probe(struct pci_dev *pdev,
 			     const struct pci_device_id *pdev_id)
 {
@@ -1508,6 +1650,12 @@ static int versal_mgmt_probe(struct pci_dev *pdev,
 	ret = vmr_char_create(vmr);
 	if (ret) {
 		VMR_ERR(vmr, "char create failed");
+		return ret;
+	}
+
+	ret = vmr_get_intf_uuid(vmr);
+	if (ret) {
+		VMR_ERR(vmr, "Failed to get interface uuid");
 		return ret;
 	}
 

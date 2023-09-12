@@ -43,7 +43,7 @@
 
 /* This header file defines struct of mgmt command type opcode */
 
-/* The Clock IP use index 0 for data, 1 for kernel, 2 for sys, 3 for sys1 */ 
+/* The Clock IP use index 0 for data, 1 for kernel, 2 for sys, 3 for sys1 */
 #define XGQ_CLOCK_WIZ_MAX_RES           4
 
 /* VMR Identify Command Version Major and Minor Numbers */
@@ -126,7 +126,7 @@ enum xgq_cmd_log_page_type {
 	XGQ_CMD_LOG_SYSTEM_DTB	= 0x7,
 	XGQ_CMD_LOG_PLM_LOG	= 0x8,
 	XGQ_CMD_LOG_APU_LOG	= 0x9,
-
+	XGQ_CMD_LOG_SHELL_INTERFACE_UUID 	= 0xa,
 };
 
 /**
@@ -302,7 +302,7 @@ struct xgq_cmd_cq_default_payload {
 };
 
 /**
- * struct xgq_cmd_cq_clock_payload: vmr clock completion payload 
+ * struct xgq_cmd_cq_clock_payload: vmr clock completion payload
  *
  * @ocl_freq: 	result of clock frequency value
  */
@@ -449,7 +449,7 @@ XGQ_STATIC_ASSERT(sizeof(struct xgq_cmd_cq) == 16, "xgq_cmd_cq has to be 16 byte
  * @vmr_status_off:	the offset of vmr device status
  * @vmr_status_len:	the length of vmr device status
  * @log_msg_index:	the current index of ring buffer log
- * @log_msg_buf_off:	the offset of dbg log 
+ * @log_msg_buf_off:	the offset of dbg log
  * @log_msg_buf_len:	the length of dbg log
  * @vmr_data_start:	the offset of data buffer started
  * @vmr_data_end: 	the offset of data buffer ended
