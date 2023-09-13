@@ -22,6 +22,7 @@
 #include <linux/cdev.h>
 #include <linux/module.h>
 #include <linux/xclbin.h>
+#include <linux/vmgmt.h>
 
 #include "xgq_cmd_vmr.h"
 #include "xgq_xocl_plat.h"
@@ -93,13 +94,6 @@
 #define VMR_DBG(vmr, fmt, args...)	dev_dbg(&(vmr)->pdev->dev, "%s: "fmt, __func__, ##args)
 
 #define ICAP_XCLBIN_V2			"xclbin2"
-
-struct versal_mgmt_ioc_xclbin {
-	char *xclbin;
-};
-
-#define VERSAL_MGMT_LOAD_XCLBIN_IOCTL	_IOW('k', 0, struct versal_mgmt_ioc_xclbin)
-#define VERSAL_MGMT_PROGRAM_SHELL_IOCTL	_IOW('k', 1, struct versal_mgmt_ioc_xclbin)
 
 struct vmr_drvdata;
 
