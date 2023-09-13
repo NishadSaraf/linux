@@ -24,7 +24,7 @@ jobs:
       run: |
         time KBUILD_BUILD_TIMESTAMP='' sudo make CC="ccache gcc" -j 3
         sudo make modules_install
-        sudo make headers_install
+        sudo make headers_install INSTALL_HDR_PATH=/usr
 
     - name: Enable Versal Management LKM
       run: ./scripts/config --enable FPGA_MGR_VERSAL_MGMT
