@@ -27,8 +27,10 @@
 #include "xgq_cmd_vmr.h"
 #include "xgq_xocl_plat.h"
 
+#define MAX_DEVICES		24
 #define DRV_VERSION		"0.1"
-#define DRV_NAME		"versal-mgmt"
+#define DRV_NAME		"vmgmt"
+#define CLASS_NAME		"versal"
 #define PCIE_DEVICE_ID_PF_V70	0x5094
 
 #define XGQ_SQ_TAIL_POINTER     0x0
@@ -97,13 +99,15 @@
 
 struct vmr_drvdata;
 
-static dev_t devt_major;
-struct class *dev_class;
+static DEFINE_IDA(vmgmt_dev_minor_ida);
+static dev_t vmgmt_devnode;
+struct class *vmgmt_class;
 
 struct vmr_char {
-	struct vmr_drvdata *vmr;
-	struct cdev cdev;
-	struct device *cdev_device;
+	int			minor;
+	struct cdev		cdev;
+	struct device		*sys_device;
+	struct vmr_drvdata	*vmr;
 };
 
 struct vmr_cmd {
@@ -1179,8 +1183,8 @@ static int comms_chan_init(struct vmr_drvdata *vmr)
 
 static int vmr_char_open(struct inode *inode, struct file *filep)
 {
-	struct cdev *icdev = inode->i_cdev;
-	struct vmr_char *vmr_char = container_of(icdev, struct vmr_char, cdev);
+	struct vmr_char *vmr_char = container_of(inode->i_cdev,
+						 struct vmr_char, cdev);
 	struct vmr_drvdata *vmr = vmr_char->vmr;
 
 	if (!vmr) {
@@ -1233,7 +1237,6 @@ static long vmr_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 	copy_buffer = vmalloc(copy_buffer_size);
 	if (!copy_buffer)
 		return -ENOMEM;
-
 	ret = copy_from_user((void *)copy_buffer, ioc_obj.xclbin, copy_buffer_size);
 	if (ret) {
 		vfree(copy_buffer);
@@ -1308,58 +1311,48 @@ static void vmr_char_destroy(struct vmr_drvdata *vmr)
 {
 	struct vmr_char *vmr_char = &vmr->char_dev;
 
-	device_destroy(dev_class, devt_major);
-	class_destroy(dev_class);
-	unregister_chrdev_region(devt_major, 1);
-
+	device_destroy(vmgmt_class, vmr_char->cdev.dev);
 	cdev_del(&vmr_char->cdev);
+	ida_free(&vmgmt_dev_minor_ida, vmr_char->minor);
 }
 
 static int vmr_char_create(struct vmr_drvdata *vmr)
 {
 	struct vmr_char *vmr_char = &vmr->char_dev;
+	u32 devid;
 	int ret;
 
-	if (alloc_chrdev_region(&devt_major, 0, 1, DRV_NAME) < 0)
-		return -EIO;
+	vmr_char->minor = ida_alloc_max(&vmgmt_dev_minor_ida, MAX_DEVICES,
+					GFP_KERNEL);
+	if (vmr_char->minor < 0) {
+		VMR_ERR(vmr, "Failed to allocate device minor ID");
+		return vmr_char->minor;
+	}
 
 	cdev_init(&vmr_char->cdev, &fops);
 	vmr_char->cdev.owner = THIS_MODULE;
+	vmr_char->cdev.dev = MKDEV(MAJOR(vmgmt_devnode), vmr_char->minor);
 
-	ret = cdev_add(&vmr_char->cdev, devt_major, 1);
+	ret = cdev_add(&vmr_char->cdev, vmr_char->cdev.dev, 1);
 	if (ret) {
-		pr_info("cdev_add %d\n", ret);
-		goto free_devt_major;
+		VMR_ERR(vmr, "Failed to add char device: %d\n", ret);
+		return -ENODEV;
 	}
 
-	dev_class = class_create("versal mgmt char driver class");
-	if (IS_ERR(dev_class)) {
-		pr_info("create class %ld\n", PTR_ERR(dev_class));
-		goto free_cdev;
-	}
-
-	vmr_char->cdev_device = device_create(dev_class, NULL, MKDEV(MAJOR(devt_major), 0),
-					      NULL, "%s", DRV_NAME);
-	if (IS_ERR(vmr_char->cdev_device)) {
-		pr_info("device create %ld\n", PTR_ERR(vmr_char->cdev_device));
-		goto free_class;
+	devid = PCI_DEVID(vmr->pdev->bus->number,vmr->pdev->devfn);
+	vmr_char->sys_device = device_create(vmgmt_class, &vmr->pdev->dev,
+					     vmr_char->cdev.dev, NULL, "%s%x",
+					     DRV_NAME, devid);
+	if (IS_ERR(vmr_char->sys_device)) {
+		VMR_ERR(vmr, "Failed to create char device: %ld\n",
+			PTR_ERR(vmr_char->sys_device));
+		cdev_del(&vmr_char->cdev);
+		return PTR_ERR(vmr_char->sys_device);
 	}
 
 	vmr_char->vmr = vmr;
 
-	VMR_INFO(vmr, "succeeded");
-
-	return 0;
-free_class:
-	class_destroy(dev_class);
-
-free_cdev:
-	kobject_put(&vmr_char->cdev.kobj);
-
-free_devt_major:
-	unregister_chrdev_region(devt_major, 1);
-
-	return -EIO;
+	return ret;
 }
 
 static int versal_fpga_write_init(struct fpga_manager *mgr,
@@ -1694,7 +1687,44 @@ static struct pci_driver versal_mgmt_driver = {
 	.remove = versal_mgmt_remove,
 };
 
-module_pci_driver(versal_mgmt_driver);
+static int __init versal_mgmt_init(void)
+{
+	int ret;
+
+	pr_info(DRV_NAME " init()\n");
+
+	vmgmt_class = class_create(CLASS_NAME);
+	if (IS_ERR(vmgmt_class))
+		return PTR_ERR(vmgmt_class);
+
+	ret = alloc_chrdev_region(&vmgmt_devnode, 0, MAX_DEVICES, DRV_NAME);
+	if (ret)
+		goto alloc_err;
+
+	ret = pci_register_driver(&versal_mgmt_driver);
+	if (ret)
+		goto reg_err;
+
+	return 0;
+
+reg_err:
+	unregister_chrdev_region(vmgmt_devnode, MAX_DEVICES);
+alloc_err:
+	pr_info(DRV_NAME " init() err\n");
+	class_destroy(vmgmt_class);
+	return ret;
+}
+
+static void versal_mgmt_exit(void)
+{
+	pr_info(DRV_NAME" exit()\n");
+	pci_unregister_driver(&versal_mgmt_driver);
+	unregister_chrdev_region(vmgmt_devnode, MAX_DEVICES);
+	class_destroy(vmgmt_class);
+}
+
+module_init(versal_mgmt_init);
+module_exit(versal_mgmt_exit);
 
 MODULE_DESCRIPTION("Versal Management PCIe Device Driver");
 MODULE_AUTHOR("AMD Corporation");
