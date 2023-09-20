@@ -615,6 +615,48 @@ static void vmr_data_payload_fini(struct vmr_drvdata *vmr)
 	shm_release_data(vmr);
 }
 
+static int vmr_log_payload_init(struct vmr_drvdata *vmr, struct vmr_cmd *cmd,
+				enum xgq_cmd_log_page_type req_pid, loff_t off, u32 req_len,
+				u32 *addr, u32 *len)
+{
+	struct xgq_cmd_log_payload *payload = NULL;
+	struct xgq_cmd_sq_hdr *hdr = NULL;
+	u32 address = 0;
+	u32 length = 0;
+
+	if (shm_acquire_log_page(vmr, &address, &length))
+		return -EIO;
+
+	if (length < req_len) {
+		VMR_ERR(vmr, "request %d is larger than available %d", req_len, length);
+		shm_release_log_page(vmr);
+		return -EINVAL;
+	}
+
+	/* update payload content */
+	payload = &cmd->xgq_cmd_entry.log_payload;
+
+	payload->address = address;
+	payload->size = req_len ? req_len : length; // if req_len is 0, use entire length
+	payload->offset = off;
+	payload->pid = req_pid;
+
+	/* update payload size in hdr */
+	hdr = &cmd->xgq_cmd_entry.hdr;
+	hdr->count = sizeof(*payload);
+
+	/* pass log buffer address and length back */
+	*addr = address;
+	*len = length;
+
+	return 0;
+}
+
+static void vmr_log_payload_fini(struct vmr_drvdata *vmr)
+{
+	shm_release_log_page(vmr);
+}
+
 static void vmr_submitted_cmd_remove(struct vmr_drvdata *vmr, struct vmr_cmd *cmd)
 {
 	struct vmr_cmd *cmd_iter;
@@ -804,6 +846,105 @@ static int vmr_transfer_data_impl(struct vmr_drvdata *vmr, char *buf, size_t len
 	return 0;
 }
 
+static int xgq_log_page_fw(struct vmr_drvdata *vmr, char **fw, size_t *fw_size,
+			   enum xgq_cmd_log_page_type req_pid, loff_t off, size_t req_size)
+{
+	struct vmr_cmd *cmd = NULL;
+	int ret = 0;
+	int id = 0;
+	u32 address = 0;
+	u32 len = 0;
+
+	ret = vmr_create_cmd(vmr, XGQ_CMD_OP_GET_LOG_PAGE, &cmd, &id, XGQ_CONFIG_TIME);
+	if (ret)
+		return ret;
+
+	ret = vmr_log_payload_init(vmr, cmd, req_pid, off, req_size, &address, &len);
+	if (ret) {
+		vmr_remove_cmd(vmr, cmd, id);
+		return ret;
+	}
+
+	ret = vmr_submit_cmd(vmr, cmd);
+	if (ret) {
+		VMR_ERR(vmr, "submit cmd failed, cid %d", id);
+		goto done;
+	}
+
+	/* wait for command completion */
+	if (wait_for_completion_killable(&cmd->xgq_cmd_complete)) {
+		VMR_ERR(vmr, "submitted cmd killed");
+		vmr_submitted_cmd_remove(vmr, cmd);
+	}
+
+	ret = cmd->xgq_cmd_rcode;
+
+	if (ret) {
+		VMR_ERR(vmr, "failed ret %d", ret);
+	} else {
+		struct xgq_cmd_cq_log_page_payload *fw_result = NULL;
+
+		fw_result = (struct xgq_cmd_cq_log_page_payload *)&cmd->xgq_cmd_cq_payload;
+
+		if (fw_result->count > len) {
+			VMR_ERR(vmr, "need to alloc %d for device data",
+				fw_result->count);
+			ret = -ENOSPC;
+		} else if (fw_result->count == 0) {
+			VMR_WARN(vmr, "fw size is zero");
+			ret = -EINVAL;
+		} else {
+			*fw_size = fw_result->count;
+			*fw = vmalloc(*fw_size);
+			if (*fw == NULL) {
+				VMR_ERR(vmr, "vmalloc failed");
+				ret = -ENOMEM;
+				goto done;
+			}
+			memcpy_from_device(vmr, address, *fw, *fw_size);
+			ret = 0;
+			VMR_INFO(vmr, "loading fw from vmr size %ld", *fw_size);
+		}
+	}
+
+done:
+	vmr_log_payload_fini(vmr);
+	vmr_remove_cmd(vmr, cmd, id);
+
+	return ret;
+}
+
+static int vmr_get_intf_uuid(struct vmr_drvdata *vmr)
+{
+	int ret = 0;
+	char *buf = NULL;
+	size_t size = 0;
+	char str[UUID_STRING_LEN];
+	u8 i, j;
+
+	ret = xgq_log_page_fw(vmr, &buf, &size,
+			      XGQ_CMD_LOG_SHELL_INTERFACE_UUID, 0, 0);
+	if (ret) {
+		VMR_INFO(vmr, "Failed to get intf uuid from vmr: %d", ret);
+		return ret;
+	}
+
+	VMR_INFO(vmr, "cast fw to string %s", buf);
+
+	/* parse uuid into a valid uuid string format */
+	for (i  = 0, j = 0; i < size; i++) {
+		str[j++] = buf[i];
+		if (j == 8 || j == 13 || j == 18 || j == 23)
+			str[j++] = '-';
+	}
+
+	VMR_INFO(vmr, "Interface uuid %s", str);
+
+	uuid_parse(str, &vmr->intf_uuid);
+
+	return ret;
+}
+
 static int vmr_download_apu_bin(struct vmr_drvdata *vmr, char *buf, size_t len)
 {
 	return vmr_transfer_data_impl(vmr, buf, len, XGQ_CMD_OP_LOAD_APUBIN);
@@ -937,8 +1078,10 @@ static inline bool vmr_xgq_device_is_ready(struct vmr_drvdata *vmr)
 		if (vmr->xgq_vmr_shared_mem.vmr_magic_no == VMR_MAGIC_NO) {
 			rval = ioread32(vmr->xgq_payload_base +
 					vmr->xgq_vmr_shared_mem.vmr_status_off);
-			if (rval)
+			if (rval) {
+				VMR_INFO(vmr, "ready rval %u", rval);
 				return true;
+			}
 		}
 	}
 
@@ -1014,6 +1157,10 @@ static int vmr_services_probe(struct vmr_drvdata *vmr)
 		vmr_stop_services(vmr);
 		return 0;
 	}
+
+	ret = vmr_get_intf_uuid(vmr);
+	if (ret)
+		VMR_ERR(vmr, "Failed to get interface uuid");
 
 	/* try to download APU firmware, user can check APU status later */
 	ret = vmr_download_apu_firmware(vmr);
@@ -1461,139 +1608,6 @@ static void versal_mgmt_remove(struct pci_dev *pdev)
 	dev_info(&pdev->dev, "%s removed.\n", __func__);
 }
 
-static int xgq_log_page_fw(struct vmr_drvdata *vmr, char **fw, size_t *fw_size,
-			   enum xgq_cmd_log_page_type req_pid, loff_t off,
-			   size_t req_size)
-{
-	struct vmr_cmd *cmd = NULL;
-	struct xgq_cmd_log_payload *payload = NULL;
-	struct xgq_cmd_sq_hdr *hdr = NULL;
-	int ret = 0;
-	int id = 0;
-	u32 address = 0;
-	u32 len = 0;
-
-	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
-	if (!cmd) {
-		VMR_ERR(vmr, "kmalloc failed, retry");
-		return -ENOMEM;
-	}
-
-	cmd->xgq_cmd_arg = cmd;
-	cmd->xgq_vmr = vmr;
-
-	hdr = &cmd->xgq_cmd_entry.hdr;
-	hdr->opcode = XGQ_CMD_OP_GET_LOG_PAGE;
-	hdr->state = XGQ_SQ_CMD_NEW;
-	hdr->count = sizeof(*payload);
-
-	mutex_lock(&vmr->xgq_lock);
-	id = idr_alloc_cyclic(&vmr->xgq_vmr_cid_idr, vmr, 0, 0, GFP_KERNEL);
-	mutex_unlock(&vmr->xgq_lock);
-	if (id < 0) {
-		VMR_ERR(vmr, "alloc cid failed: %d", id);
-		ret = -ENOMEM;
-		goto exit;
-	}
-	hdr->cid = id;
-
-	/* init condition veriable */
-	init_completion(&cmd->xgq_cmd_complete);
-
-	/* set timeout actual jiffies */
-	cmd->xgq_cmd_timeout_jiffies = jiffies + XGQ_CONFIG_TIME;
-
-	if (shm_acquire_log_page(vmr, &address, &len)) {
-		ret = -EIO;
-		goto exit;
-	}
-
-	/* adjust requested len based on req_size */
-	len = (req_size && req_size < len) ? req_size : len;
-
-	payload = &cmd->xgq_cmd_entry.log_payload;
-	payload->address = address;
-	payload->size = len;
-	payload->offset = off;
-	payload->pid = req_pid;
-
-	ret = vmr_submit_cmd(vmr, cmd);
-	if (ret) {
-		VMR_ERR(vmr, "submit cmd failed, cid %d", id);
-		goto done;
-	}
-
-	while (!wait_for_completion_timeout(&cmd->xgq_cmd_complete, XGQ_WAIT_TIMEOUT))
-		cond_resched();
-
-	ret = cmd->xgq_cmd_rcode;
-
-	if (ret) {
-		VMR_ERR(vmr, "intf uuid fetch failed ret %d", ret);
-	} else {
-		struct xgq_cmd_cq_log_page_payload *intf_uuid = NULL;
-
-		intf_uuid = (struct xgq_cmd_cq_log_page_payload *)&cmd->xgq_cmd_cq_payload;
-
-		if (intf_uuid->count > len) {
-			VMR_ERR(vmr, "need to alloc %d for device data",
-				intf_uuid->count);
-			ret = -ENOSPC;
-		} else if (intf_uuid->count == 0) {
-			VMR_WARN(vmr, "uuid size is zero");
-			ret = -EINVAL;
-		} else {
-			*fw_size = intf_uuid->count;
-			*fw = vmalloc(*fw_size);
-			if (*fw == NULL) {
-				VMR_ERR(vmr, "vmalloc failed");
-				ret = -ENOMEM;
-				goto done;
-			}
-			memcpy_from_device(vmr, address, *fw, *fw_size);
-			ret = 0;
-			VMR_INFO(vmr, "loading uuid from vmr size %ld",
-				 *fw_size);
-			VMR_INFO(vmr, "Interface uuid %s", *fw);
-		}
-	}
-
-done:
-	shm_release_log_page(vmr);
-exit:
-	vmr_remove_cmd(vmr, cmd, id);
-	return ret;
-}
-
-static int vmr_get_intf_uuid(struct vmr_drvdata *vmr)
-{
-	int ret = 0;
-	char *buf = NULL;
-	size_t size = 0;
-	char str[UUID_STRING_LEN];
-	u8 i, j;
-
-	ret = xgq_log_page_fw(vmr, &buf, &size,
-			      XGQ_CMD_LOG_SHELL_INTERFACE_UUID, 0, 0);
-	if (ret) {
-		VMR_INFO(vmr, "Failed to get intf uuid from vmr: %d", ret);
-		return ret;
-	}
-
-	/* parse uuid into a valid uuid string format */
-	for (i  = 0, j = 0; i < size; i++) {
-		str[j++] = buf[i];
-		if (j == 8 || j == 13 || j == 18 || j == 23)
-			str[j++] = '-';
-	}
-
-	VMR_INFO(vmr, "Interface uuid %s", str);
-
-	uuid_parse(str, &vmr->intf_uuid);
-
-	return ret;
-}
-
 static int versal_mgmt_probe(struct pci_dev *pdev,
 			     const struct pci_device_id *pdev_id)
 {
@@ -1601,12 +1615,6 @@ static int versal_mgmt_probe(struct pci_dev *pdev,
 	void __iomem * const *tbl;
 	int bar_mask;
 	int ret;
-
-	ret = pcim_enable_device(pdev);
-	if (ret < 0) {
-		dev_err(&pdev->dev, "Failed to enable device %d.", ret);
-		return ret;
-	}
 
 	vmr = devm_kzalloc(&pdev->dev, sizeof(*vmr), GFP_KERNEL);
 	if (!vmr)
@@ -1618,11 +1626,19 @@ static int versal_mgmt_probe(struct pci_dev *pdev,
 	sema_init(&vmr->xgq_data_sema, 1);
 	sema_init(&vmr->xgq_log_page_sema, 1);
 
+	ret = pcim_enable_device(pdev);
+	if (ret) {
+		dev_err(&pdev->dev, "Failed to enable device %d.", ret);
+		return ret;
+	}
+
+	/*TODO: cleanup iomap bars, using regular ioremap and ioremap_wc for
+	 * shared memory buffer to get better performance */
 	bar_mask = pci_select_bars(pdev, IORESOURCE_MEM);
 	ret = pcim_iomap_regions(pdev, bar_mask, "versal-mgmt");
 	if (ret) {
 		VMR_ERR(vmr, "map regions failed: %d", ret);
-		return -ENOMEM;
+		return ret;
 	}
 
 	tbl = pcim_iomap_table(pdev);
@@ -1630,6 +1646,7 @@ static int versal_mgmt_probe(struct pci_dev *pdev,
 		VMR_ERR(vmr, "create iomap table failed.");
 		return -ENOMEM;
 	}
+
 	vmr->xgq_sq_base = tbl[XGQ_VMR_SQ_BAR] + XGQ_VMR_SQ_BAR_OFF;
 	vmr->comms_chan_base = tbl[COMMS_CHAN_BAR] + COMMS_CHAN_BAR_OFF;
 	vmr->xgq_payload_base = tbl[XGQ_VMR_PAYLOAD_BAR] + XGQ_VMR_PAYLOAD_OFF;
@@ -1638,7 +1655,7 @@ static int versal_mgmt_probe(struct pci_dev *pdev,
 
 	ret = vmr_start_services(vmr);
 	if (ret)
-		return -ENODEV;
+		return ret;
 
 	idr_init(&vmr->xgq_vmr_cid_idr);
 	INIT_LIST_HEAD(&vmr->xgq_submitted_cmds);
@@ -1647,37 +1664,45 @@ static int versal_mgmt_probe(struct pci_dev *pdev,
 	init_complete_worker(&vmr->xgq_complete_worker);
 
 	(void)vmr_services_probe(vmr);
-
-	vmr->comms.vmr = vmr;
-	ret = comms_chan_init(vmr);
-	if (ret) {
-		versal_mgmt_remove(pdev);
-		return -ENODEV;
-	}
-
 	pci_set_drvdata(pdev, vmr);
 
 	ret = vmr_char_create(vmr);
 	if (ret) {
-		VMR_ERR(vmr, "char create failed");
-		return ret;
+		VMR_ERR(vmr, "char create failed: %d", ret);
+		goto char_create_failed;
 	}
 
-	ret = vmr_get_intf_uuid(vmr);
+	vmr->comms.vmr = vmr;
+	ret = comms_chan_init(vmr);
 	if (ret) {
-		VMR_ERR(vmr, "Failed to get interface uuid");
-		return ret;
+		VMR_ERR(vmr, "comms chan create failed: %d", ret);
+		goto comms_chan_failed;
 	}
 
 	/* register fpga manager */
 	vmr->mgr = devm_fpga_mgr_register(&pdev->dev, "AMD Versal FPGA Manager",
 					  &versal_fpga_ops, vmr);
-	if (IS_ERR(vmr->mgr))
-		return PTR_ERR(vmr->mgr);
+	if (IS_ERR(vmr->mgr)) {
+		ret = PTR_ERR(vmr->mgr);
+		goto fpga_mgr_failed;
+	}
 
 	VMR_INFO(vmr, "succeeded");
-
 	return 0;
+
+fpga_mgr_failed:
+	comms_chan_finish(vmr);
+
+comms_chan_failed:
+	vmr_char_destroy(vmr);
+
+char_create_failed:
+	vmr_stop_services(vmr);
+	fini_worker(&vmr->xgq_complete_worker);
+	idr_destroy(&vmr->xgq_vmr_cid_idr);
+	mutex_destroy(&vmr->xgq_lock);
+
+	return ret;
 }
 
 static struct pci_driver versal_mgmt_driver = {
