@@ -12,7 +12,9 @@
 #include <linux/delay.h>
 #include <linux/kthread.h>
 #include <linux/firmware.h>
+#include <linux/fpga/fpga-bridge.h>
 #include <linux/fpga/fpga-mgr.h>
+#include <linux/fpga/fpga-region.h>
 #include <linux/timer.h>
 #include <linux/jiffies.h>
 #include <linux/workqueue.h>
@@ -244,6 +246,8 @@ struct vmr_drvdata {
 	void __iomem		*comms_chan_base;
 	struct comms_chan	comms;
 
+	struct fpga_bridge	*bridge;
+	struct fpga_region	*region;
 	struct fpga_manager	*mgr;
 	enum fpga_mgr_states	state;
 	struct vmr_fw_tnx	fw_tnx;
@@ -1563,6 +1567,65 @@ static int vmr_char_close(struct inode *inode, struct file *filep)
 	return 0;
 }
 
+struct vmr_region_match_arg {
+	struct vmr_drvdata *vmr;
+	uuid_t *uuid;
+};
+
+static int vmr_region_match(struct device *dev, const void *data)
+{
+	const struct vmr_region_match_arg *arg = data;
+	const struct fpga_region *match_region;
+	struct vmr_drvdata *vmr = arg->vmr;
+	uuid_t compat_uuid;
+
+	if (dev->parent != &arg->vmr->pdev->dev)
+		return false;
+
+	match_region = to_fpga_region(dev);
+
+	import_uuid(&compat_uuid, (const char *)match_region->compat_id);
+	if (uuid_equal(&compat_uuid, arg->uuid)) {
+		VMR_INFO(vmr, "Region match found");
+		return true;
+	}
+
+	VMR_INFO(vmr, "Region match failed");
+	return false;
+}
+
+static int vmr_region_program(struct fpga_region *region, const void *xclbin)
+{
+	const struct axlf *xclbin_obj = xclbin;
+	struct vmr_drvdata *vmr = region->priv;
+	struct fpga_image_info *info;
+	int ret;
+
+	info = fpga_image_info_alloc(&vmr->pdev->dev);
+	if (!info) {
+		VMR_ERR(vmr, "Failed to alloc fpga image info: %d", ret);
+		return -ENOMEM;
+	}
+
+	info->buf = xclbin;
+	info->count = xclbin_obj->header.length;
+	info->flags |= FPGA_MGR_PARTIAL_RECONFIG;
+	region->info = info;
+	ret = fpga_region_program_fpga(region);
+	if (ret) {
+		VMR_ERR(vmr, "Programming xclbin failed: %d", ret);
+		goto exit;
+	}
+
+	/* free bridges to allow reprogram */
+	if (region->get_bridges)
+		fpga_bridges_put(&region->bridge_list);
+
+exit:
+	fpga_image_info_free(info);
+	return ret;
+}
+
 static long vmr_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 {
 	struct vmr_drvdata *vmr = (struct vmr_drvdata *)filep->private_data;
@@ -1570,8 +1633,8 @@ static long vmr_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 	struct axlf xclbin = { 0 };
 	void *copy_buffer = NULL;
 	size_t copy_buffer_size = 0;
-	struct fpga_manager *mgr;
-	struct fpga_image_info *info;
+	struct fpga_region *region = NULL;
+	struct vmr_region_match_arg reg = { 0 };
 	int ret = 0;
 
 	ret = copy_from_user((void *)&ioc_obj, (void *)arg, sizeof(ioc_obj));
@@ -1605,14 +1668,6 @@ static long vmr_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 
 	switch (cmd) {
 	case VERSAL_MGMT_LOAD_XCLBIN_IOCTL:
-		/* Check xclbin compatibility with the base shell */
-		if (!uuid_equal(&vmr->intf_uuid, &xclbin.header.rom_uuid)) {
-			VMR_ERR(vmr, "xclbin incompatible with base shell");
-			VMR_ERR(vmr, "xclbin interface UUID: %pU",
-				&xclbin.header.rom_uuid);
-			vfree(copy_buffer);
-			return -EINVAL;
-		}
 		vmr->fw_tnx.opcode = XGQ_CMD_OP_LOAD_XCLBIN;
 		break;
 	case VERSAL_MGMT_PROGRAM_SHELL_IOCTL:
@@ -1623,39 +1678,26 @@ static long vmr_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 		return -EINVAL;
 	}
 
-	mgr = fpga_mgr_get(&vmr->pdev->dev);
-	if (IS_ERR(mgr)) {
-		ret = PTR_ERR(mgr);
-		goto exit4;
+	reg.uuid = &xclbin.header.rom_uuid;
+	reg.vmr = vmr;
+
+	region = fpga_region_class_find(NULL, &reg, vmr_region_match);
+	if (!region) {
+		VMR_ERR(vmr, "Failed to find compatible region");
+		ret = -ENOENT;
+		goto exit;
 	}
 
-	ret = fpga_mgr_lock(mgr);
-	if (ret)
-		goto exit3;
-
-	info = fpga_image_info_alloc(&vmr->pdev->dev);
-	if (!info) {
-		ret = -ENOMEM;
-		goto exit2;
+	ret = vmr_region_program(region, copy_buffer);
+	if (ret) {
+		VMR_ERR(vmr, "Failed to program region");
+		goto exit;
 	}
-
-	info->buf = copy_buffer;
-	info->count = copy_buffer_size;
-
-	ret = fpga_mgr_load(mgr, info);
-	if (ret)
-		goto exit1;
 
 	VMR_INFO(vmr, "Downloaded firmware %pUb of size %zu bytes",
 		 &xclbin.header.uuid, copy_buffer_size);
 	uuid_copy(&vmr->xclbin_uuid, &xclbin.header.uuid);
-exit1:
-	fpga_image_info_free(info);
-exit2:
-	fpga_mgr_unlock(mgr);
-exit3:
-	fpga_mgr_put(mgr);
-exit4:
+exit:
 	vfree(copy_buffer);
 	return ret;
 }
@@ -1766,20 +1808,15 @@ static int versal_fpga_write_complete(struct fpga_manager *mgr,
 		goto done;
 	}
 
-	/*
-	 * For pdi/xclbin data transfer, we block any cancellation and
-	 * wait till command completed and then release resources safely.
-	 * We call cond_resched after every timeout to avoid linux kernel
-	 * warning for thread hanging too long.
-	 */
-	while (!wait_for_completion_timeout(&vmr->fw_tnx.cmd->xgq_cmd_complete,
-					    XGQ_WAIT_TIMEOUT))
-		cond_resched();
-
-	if (vmr->fw_tnx.cmd->xgq_cmd_rcode) {
+	ret = wait_for_completion_timeout(&vmr->fw_tnx.cmd->xgq_cmd_complete,
+					  XGQ_WAIT_TIMEOUT);
+	if (!ret) {
+		VMR_ERR(vmr, "Image download timed out");
 		ret = -ETIMEDOUT;
 		vmr->state = FPGA_MGR_STATE_WRITE_COMPLETE_ERR;
 		goto done;
+	} else {
+		ret = 0;
 	}
 
 	vmr->state = FPGA_MGR_STATE_WRITE_COMPLETE;
@@ -1808,6 +1845,11 @@ static void versal_mgmt_remove(struct pci_dev *pdev)
 {
 	struct vmr_drvdata *vmr = pci_get_drvdata(pdev);
 
+	if (vmr->bridge)
+		fpga_bridge_unregister(vmr->bridge);
+	if (vmr->region)
+		fpga_region_unregister(vmr->region);
+
 	comms_chan_finish(vmr);
 	vmr_char_destroy(vmr);
 	vmr_stop_services(vmr);
@@ -1821,10 +1863,27 @@ static void versal_mgmt_remove(struct pci_dev *pdev)
 	dev_info(&pdev->dev, "%s removed.\n", __func__);
 }
 
+static struct fpga_bridge_ops vmr_br_ops;
+
+static struct fpga_bridge *vmr_create_bridge(struct vmr_drvdata *vmr)
+{
+	return fpga_bridge_register(&vmr->pdev->dev, "vmgmt_base_br",
+				    &vmr_br_ops, vmr);
+}
+
+static int vmr_get_bridges(struct fpga_region *region)
+{
+	struct vmr_drvdata *vmr = region->priv;
+	struct device *dev = &vmr->pdev->dev;
+
+	return fpga_bridge_get_to_list(dev, region->info, &region->bridge_list);
+}
+
 static int versal_mgmt_probe(struct pci_dev *pdev,
 			     const struct pci_device_id *pdev_id)
 {
 	struct vmr_drvdata *vmr;
+	struct fpga_region_info region;
 	void __iomem * const *tbl;
 	int bar_mask;
 	int ret;
@@ -1903,8 +1962,35 @@ static int versal_mgmt_probe(struct pci_dev *pdev,
 		goto fpga_mgr_failed;
 	}
 
+	/* create fgpa bridge, region for the base shell */
+	vmr->bridge = vmr_create_bridge(vmr);
+	if (IS_ERR(vmr->bridge)) {
+		VMR_ERR(vmr, "Failed to register FPGA bridge for base shell: %ld",
+			PTR_ERR(vmr->bridge));
+		ret = PTR_ERR(vmr->bridge);
+		vmr->bridge = NULL;
+		goto fpga_mgr_failed;
+	}
+
+	region.mgr = vmr->mgr;
+	region.compat_id = (struct fpga_compat_id *)&vmr->intf_uuid;
+	region.get_bridges = vmr_get_bridges;
+	region.priv = vmr;
+
+	vmr->region = fpga_region_register_full(&pdev->dev, &region);
+	if (IS_ERR(vmr->region)) {
+		VMR_ERR(vmr, "Failed to register FPGA region for base shell: %ld",
+			PTR_ERR(vmr->region));
+		ret = PTR_ERR(vmr->region);
+		vmr->region = NULL;
+		goto fpga_region_failed;
+	}
+
 	VMR_INFO(vmr, "succeeded");
 	return 0;
+
+fpga_region_failed:
+	fpga_bridge_unregister(vmr->bridge);
 
 fpga_mgr_failed:
 	comms_chan_finish(vmr);
