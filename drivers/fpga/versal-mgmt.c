@@ -31,7 +31,8 @@
 #define DRV_VERSION		"0.1"
 #define DRV_NAME		"vmgmt"
 #define CLASS_NAME		"versal"
-#define PCIE_DEVICE_ID_PF_V70	0x5094
+#define PCIE_DEVICE_ID_PF_V70		0x5094
+#define PCIE_DEVICE_ID_PF_V70PQ2	0x50b0
 
 #define XGQ_SQ_TAIL_POINTER     0x0
 #define XGQ_SQ_INTR_REG         0x4
@@ -46,6 +47,9 @@
 #define XGQ_VMR_PAYLOAD_BAR	0
 #define XGQ_VMR_PAYLOAD_OFF	0x8000000
 #define XGQ_VMR_PAYLOAD_SIZE	0x8000000
+
+#define XGQ_VMR_PMC_BAR		0
+#define XGQ_VMR_PMC_BAR_OFF	0x2040000
 
 #define XGQ_INVALID_CID		0xFFFF
 #define XGQ_FLASH_TIME		msecs_to_jiffies(600 * 1000)
@@ -223,6 +227,7 @@ struct vmr_drvdata {
 	void __iomem		*xgq_sq_base;
 	void __iomem		*xgq_cq_base;
 	void __iomem		*xgq_ring_base;
+	void __iomem		*xgq_pmc_mux_base;
 	struct mutex		xgq_lock; /* for exclusive reference to xgq command data */
 	struct idr		xgq_vmr_cid_idr;
 	struct vmr_shared_mem	xgq_vmr_shared_mem;
@@ -232,6 +237,7 @@ struct vmr_drvdata {
 	struct semaphore	xgq_data_sema;
 	struct semaphore	xgq_log_page_sema;
 	struct xgq_cmd_cq_default_payload xgq_cq_payload;
+	int			xgq_vmr_debug_level;
 	bool			xgq_vmr_program;
 	uuid_t			xclbin_uuid;
 	uuid_t			intf_uuid;
@@ -241,10 +247,13 @@ struct vmr_drvdata {
 	struct fpga_manager	*mgr;
 	enum fpga_mgr_states	state;
 	struct vmr_fw_tnx	fw_tnx;
+
+	u32			saved_config[8][16]; /* save config for pci reset */
 };
 
 static const struct pci_device_id versal_mgmt_id_tbl[] = {
 	{PCI_DEVICE(PCI_VENDOR_ID_XILINX, PCIE_DEVICE_ID_PF_V70),},
+	{PCI_DEVICE(PCI_VENDOR_ID_XILINX, PCIE_DEVICE_ID_PF_V70PQ2),},
 	{0,}
 };
 
@@ -960,6 +969,24 @@ static void vmr_cq_result_copy(struct vmr_drvdata *vmr, struct vmr_cmd *cmd)
 	mutex_unlock(&vmr->xgq_lock);
 }
 
+static int vmr_control_payload_update(struct vmr_drvdata *vmr, struct vmr_cmd *cmd,
+				    enum xgq_cmd_vmr_control_type req_type)
+{
+	struct xgq_cmd_vmr_control_payload *payload = NULL;
+	struct xgq_cmd_sq_hdr *hdr = NULL;
+
+	/* update payload content */
+	payload = &(cmd->xgq_cmd_entry.vmr_control_payload);
+	payload->req_type = req_type;
+	payload->debug_level = vmr->xgq_vmr_debug_level;
+
+	/* update payload size in hdr */
+	hdr = &(cmd->xgq_cmd_entry.hdr);
+	hdr->count = sizeof(*payload);
+
+	return 0;
+}
+
 static int vmr_control_op(struct vmr_drvdata *vmr, enum xgq_cmd_vmr_control_type req_type)
 {
 	struct vmr_cmd *cmd = NULL;
@@ -969,6 +996,8 @@ static int vmr_control_op(struct vmr_drvdata *vmr, enum xgq_cmd_vmr_control_type
 	ret = vmr_create_cmd(vmr, XGQ_CMD_OP_VMR_CONTROL, &cmd, &id, XGQ_CONFIG_TIME);
 	if (ret)
 		return ret;
+
+	vmr_control_payload_update(vmr, cmd, req_type);
 
 	ret = vmr_submit_cmd(vmr, cmd);
 	if (ret) {
@@ -1188,8 +1217,177 @@ u32 comms_chan_get_protocol_version(void *payload)
 	return sizeof(*resp);
 }
 
+#define PL_TO_PMC_ERROR_SIGNAL_PATH_MASK        (1 << 0)
+
+static int enable_vmr_boot(struct vmr_drvdata *vmr)
+{
+	u32 val;
+
+	/* refer to xocl_enable_vmr_boot */
+	/* TODO: skip set default boot for now, need to add new opcode */
+
+	/* set reset signal */
+	val = ioread32(vmr->xgq_pmc_mux_base);
+	val |= PL_TO_PMC_ERROR_SIGNAL_PATH_MASK;
+	iowrite32(val, vmr->xgq_pmc_mux_base);
+
+	VMR_INFO(vmr, "mux control is 0x%x", ioread32(vmr->xgq_pmc_mux_base));
+
+	return 0;
+}
+
+int xocl_wait_pci_status(struct pci_dev *pdev, u16 mask, u16 val, int timeout)
+{
+        u16     pci_cmd;
+        int     i;
+        
+        if (!timeout)
+                timeout = 5000;
+        else
+                timeout *= 1000;
+        
+        for (i = 0; i < timeout; i++) {
+                pci_read_config_word(pdev, PCI_COMMAND, &pci_cmd);
+                if (pci_cmd != 0xffff && (pci_cmd & mask) == val)
+                        break;
+                msleep(1);
+        }
+
+        printk("DZ_ waiting for %d ms\n", i);
+        if (i == timeout)
+                return -ETIME;
+        
+        return 0;
+}
+
+static void xocl_save_config_space(struct pci_dev *pdev, u32 *saved_config)
+{
+        int i;
+
+        for (i = 0; i < 16; i++)
+                pci_read_config_dword(pdev, i * 4, &saved_config[i]);
+}
+
+#define XOCL_DEV_ID(pdev)                       \
+        ((pci_domain_nr(pdev->bus) << 16) |     \
+        PCI_DEVID(pdev->bus->number, pdev->devfn))
+
+static int xocl_match_slot_and_save(struct device *dev, void *data)
+{
+	struct vmr_drvdata *vmr = data;
+        struct pci_dev *pdev;
+
+        pdev = to_pci_dev(dev);
+
+        if ((XOCL_DEV_ID(pdev) >> 3) == (XOCL_DEV_ID(vmr->pdev) >> 3)) {
+                pci_cfg_access_lock(pdev);
+                pci_save_state(pdev);
+                xocl_save_config_space(pdev, vmr->saved_config[PCI_FUNC(pdev->devfn)]);
+        }
+
+        return 0;
+}
+
+static void xocl_restore_config_space(struct pci_dev *pdev, u32 *config_saved)
+{       
+        int i;
+        u32 val;
+        
+        for (i = 0; i < 16; i++) {
+                pci_read_config_dword(pdev, i * 4, &val);
+                if (val == config_saved[i])
+                        continue;
+                
+                pci_write_config_dword(pdev, i * 4, config_saved[i]);
+                pci_read_config_dword(pdev, i * 4, &val);
+                if (val != config_saved[i]) {
+                	printk("DZ_ restore config at %d failed\n", i * 4);
+                }
+        }
+}
+
+static int xocl_match_slot_and_restore(struct device *dev, void *data)
+{
+	struct vmr_drvdata *vmr = data;
+        struct pci_dev *pdev;
+
+        pdev = to_pci_dev(dev);
+
+        if ((XOCL_DEV_ID(pdev) >> 3) == (XOCL_DEV_ID(vmr->pdev) >> 3)) {
+                xocl_restore_config_space(pdev, vmr->saved_config[PCI_FUNC(pdev->devfn)]);
+                pci_restore_state(pdev);
+                pci_cfg_access_unlock(pdev);
+        }
+
+        return 0;
+}
+
+static void vmgmt_reset_pci(struct vmr_drvdata *vmr)
+{
+	struct pci_dev *pdev = vmr->pdev;
+	struct pci_bus *bus;
+	u16 slot_ctrl_orig = 0, slot_ctrl;
+	u8 pci_bctl;
+	u16 pci_cmd, devctl;
+
+	VMR_WARN(vmr, "Reset PCI");
+
+	/*TODO: pci_save_config_all */
+	bus_for_each_dev(&pci_bus_type, NULL, vmr, xocl_match_slot_and_save);
+
+	pci_disable_device(pdev);
+	bus = pdev->bus;
+
+        pcie_capability_read_word(bus->self, PCI_EXP_SLTCTL, &slot_ctrl);
+        if (slot_ctrl != (u16) ~0) {
+                slot_ctrl_orig = slot_ctrl;
+                slot_ctrl &= ~(PCI_EXP_SLTCTL_HPIE);
+                pcie_capability_write_word(bus->self, PCI_EXP_SLTCTL, slot_ctrl);
+        }
+        /*
+         * When flipping the SBR bit, device can fall off the bus. This is usually
+         * no problem at all so long as drivers are working properly after SBR.
+         * However, some systems complain bitterly when the device falls off the bus.
+         * Such as a Dell Servers, The iDRAC is totally independent from the
+         * operating system; it will still reboot the machine even if the operating
+         * system ignores the error.
+         * The quick solution is to temporarily disable the SERR reporting of
+         * switch port during SBR.
+         */
+        pci_read_config_word(bus->self, PCI_COMMAND, &pci_cmd);
+        pci_write_config_word(bus->self, PCI_COMMAND, (pci_cmd & ~PCI_COMMAND_SERR));
+        pcie_capability_read_word(bus->self, PCI_EXP_DEVCTL, &devctl);
+        pcie_capability_write_word(bus->self, PCI_EXP_DEVCTL,
+                                           (devctl & ~PCI_EXP_DEVCTL_FERE));
+        
+        pci_read_config_byte(bus->self, PCI_BRIDGE_CONTROL, &pci_bctl);
+        pci_bctl |= PCI_BRIDGE_CTL_BUS_RESET;
+        pci_write_config_byte(bus->self, PCI_BRIDGE_CONTROL, pci_bctl);
+                
+        if (!slot_ctrl_orig)
+                pcie_capability_write_word(bus->self, PCI_EXP_SLTCTL, slot_ctrl_orig);
+        
+        msleep(100);
+        pci_bctl &= ~PCI_BRIDGE_CTL_BUS_RESET;
+        pci_write_config_byte(bus->self, PCI_BRIDGE_CONTROL, pci_bctl);
+        ssleep(1);
+
+        pcie_capability_write_word(bus->self, PCI_EXP_DEVCTL, devctl);
+        pci_write_config_word(bus->self, PCI_COMMAND, pci_cmd);
+
+        if (pci_enable_device(pdev))
+                VMR_ERR(vmr, "failed to enable pci device");
+
+	xocl_wait_pci_status(pdev, 0, 0, 0);
+
+	bus_for_each_dev(&pci_bus_type, NULL, vmr, xocl_match_slot_and_restore);
+
+	/*TODO: config pci */
+}
+
 void comms_chan_send_response(struct comms_chan *comms, struct comms_msg *msg)
 {
+	struct pci_dev *pdev = comms->vmr->pdev;
 	struct comms_srv_req *req = (struct comms_srv_req *)msg->data;
 	struct comms_hw_msg response = {0};
 	u32 size;
@@ -1202,12 +1400,27 @@ void comms_chan_send_response(struct comms_chan *comms, struct comms_msg *msg)
 	case COMMS_REQ_OPS_GET_XCLBIN_UUID:
 		size = comms_chan_get_xclbin_uuid(comms->vmr, response.body.payload);
 		break;
+	case COMMS_REQ_OPS_HOT_RESET:
+		// enable_vmr_boot
+		// offline vmr_services
+		// xclmgmt_reset_pci 
+		VMR_WARN(comms->vmr, "Trying to reset card in slot %s:%02x:%lx",
+			 pdev->bus->name, PCI_SLOT(pdev->devfn), PCI_FUNC(pdev->devfn));
+		enable_vmr_boot(comms->vmr);
+		vmr_stop_services(comms->vmr);
+		vmgmt_reset_pci(comms->vmr);
+		vmr_start_services(comms->vmr);
+		*response.body.payload = 0;
+		size = sizeof(int);
+		break;
 	default:
 		VMR_ERR(comms->vmr, "Unsupported request opcode: %d",
 			req->opcode);
 		*response.body.payload = -1;
 		size = sizeof(int);
 	}
+
+	VMR_INFO(comms->vmr, "response opcode:%d", req->opcode);
 
 	response.header.type = COMMS_MSG_START | COMMS_MSG_END;
 	response.header.payload_size = size;
@@ -1622,6 +1835,7 @@ static int versal_mgmt_probe(struct pci_dev *pdev,
 
 	vmr->pdev = pdev;
 	vmr->xgq_halted = true;
+	vmr->xgq_vmr_debug_level = 2;
 	mutex_init(&vmr->xgq_lock);
 	sema_init(&vmr->xgq_data_sema, 1);
 	sema_init(&vmr->xgq_log_page_sema, 1);
@@ -1647,9 +1861,11 @@ static int versal_mgmt_probe(struct pci_dev *pdev,
 		return -ENOMEM;
 	}
 
-	vmr->xgq_sq_base = tbl[XGQ_VMR_SQ_BAR] + XGQ_VMR_SQ_BAR_OFF;
 	vmr->comms_chan_base = tbl[COMMS_CHAN_BAR] + COMMS_CHAN_BAR_OFF;
+	vmr->xgq_pmc_mux_base = tbl[XGQ_VMR_PMC_BAR] + XGQ_VMR_PMC_BAR_OFF;
 	vmr->xgq_payload_base = tbl[XGQ_VMR_PAYLOAD_BAR] + XGQ_VMR_PAYLOAD_OFF;
+
+	vmr->xgq_sq_base = tbl[XGQ_VMR_SQ_BAR] + XGQ_VMR_SQ_BAR_OFF;
 	vmr->xgq_sq_base = vmr->xgq_sq_base + XGQ_SQ_TAIL_POINTER;
 	vmr->xgq_cq_base = vmr->xgq_sq_base + XGQ_CQ_TAIL_POINTER;
 
