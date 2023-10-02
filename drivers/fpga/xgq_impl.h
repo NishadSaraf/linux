@@ -47,7 +47,7 @@
 # include <errno.h>
 #endif /* __KERNEL__ */
 
-#include "xgq_cmd_common.h"
+#include "xgq_cmd.h"
 
 /*
  * Standard bool type's portability is poor across multiple OSes and HW platforms.

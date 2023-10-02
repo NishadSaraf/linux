@@ -25,9 +25,11 @@
 #include <linux/module.h>
 #include <linux/xclbin.h>
 #include <linux/vmgmt.h>
+#include <linux/module.h>
 
-#include "xgq_cmd_vmr.h"
-#include "xgq_xocl_plat.h"
+//#define XGQ_IMPL
+#include "xgq_cmd.h"
+//#include "xgq_impl.h"
 
 #define MAX_DEVICES		24
 #define DRV_VERSION		"0.1"
@@ -606,7 +608,7 @@ static void shm_release_data(struct vmr_drvdata *vmr)
 	up(&vmr->xgq_data_sema);
 }
 
-static u32 inline shm_addr_log_page(struct vmr_drvdata *vmr)
+static inline u32 shm_addr_log_page(struct vmr_drvdata *vmr)
 {
 	return vmr->xgq_vmr_shared_mem.vmr_data_start + VMR_LOG_ADDR_OFF;
 }
@@ -1037,7 +1039,7 @@ static int xgq_log_page_fw(struct vmr_drvdata *vmr, char **fw, size_t *fw_size,
 		} else {
 			*fw_size = fw_result->count;
 			*fw = vmalloc(*fw_size);
-			if (*fw == NULL) {
+			if (!*fw) {
 				VMR_ERR(vmr, "vmalloc failed");
 				ret = -ENOMEM;
 				goto done;
@@ -1102,18 +1104,18 @@ static void vmr_cq_result_copy(struct vmr_drvdata *vmr, struct vmr_cmd *cmd)
 }
 
 static int vmr_control_payload_update(struct vmr_drvdata *vmr, struct vmr_cmd *cmd,
-				    enum xgq_cmd_vmr_control_type req_type)
+				      enum xgq_cmd_vmr_control_type req_type)
 {
 	struct xgq_cmd_vmr_control_payload *payload = NULL;
 	struct xgq_cmd_sq_hdr *hdr = NULL;
 
 	/* update payload content */
-	payload = &(cmd->xgq_cmd_entry.vmr_control_payload);
+	payload = &cmd->xgq_cmd_entry.vmr_control_payload;
 	payload->req_type = req_type;
 	payload->debug_level = vmr->xgq_vmr_debug_level;
 
 	/* update payload size in hdr */
-	hdr = &(cmd->xgq_cmd_entry.hdr);
+	hdr = &cmd->xgq_cmd_entry.hdr;
 	hdr->count = sizeof(*payload);
 
 	return 0;
@@ -1349,7 +1351,7 @@ u32 comms_chan_get_protocol_version(void *payload)
 	return sizeof(*resp);
 }
 
-#define PL_TO_PMC_ERROR_SIGNAL_PATH_MASK        (1 << 0)
+#define PL_TO_PMC_ERROR_SIGNAL_PATH_MASK        BIT(0)
 
 static int enable_vmr_boot(struct vmr_drvdata *vmr)
 {
@@ -1370,88 +1372,87 @@ static int enable_vmr_boot(struct vmr_drvdata *vmr)
 
 int xocl_wait_pci_status(struct pci_dev *pdev, u16 mask, u16 val, int timeout)
 {
-        u16     pci_cmd;
-        int     i;
-        
-        if (!timeout)
-                timeout = 5000;
-        else
-                timeout *= 1000;
-        
-        for (i = 0; i < timeout; i++) {
-                pci_read_config_word(pdev, PCI_COMMAND, &pci_cmd);
-                if (pci_cmd != 0xffff && (pci_cmd & mask) == val)
-                        break;
-                msleep(1);
-        }
+	u16     pci_cmd;
+	int     i;
 
-        printk("DZ_ waiting for %d ms\n", i);
-        if (i == timeout)
-                return -ETIME;
-        
-        return 0;
+	if (!timeout)
+		timeout = 5000;
+	else
+		timeout *= 1000;
+
+	for (i = 0; i < timeout; i++) {
+		pci_read_config_word(pdev, PCI_COMMAND, &pci_cmd);
+		if (pci_cmd != 0xffff && (pci_cmd & mask) == val)
+			break;
+		usleep_range(1000, 1001);
+	}
+
+	pr_info("DZ_ waiting for %d ms\n", i);
+	if (i == timeout)
+		return -ETIME;
+
+	return 0;
 }
 
 static void xocl_save_config_space(struct pci_dev *pdev, u32 *saved_config)
 {
-        int i;
+	int i;
 
-        for (i = 0; i < 16; i++)
-                pci_read_config_dword(pdev, i * 4, &saved_config[i]);
+	for (i = 0; i < 16; i++)
+		pci_read_config_dword(pdev, i * 4, &saved_config[i]);
 }
 
 #define XOCL_DEV_ID(pdev)                       \
-        ((pci_domain_nr(pdev->bus) << 16) |     \
-        PCI_DEVID(pdev->bus->number, pdev->devfn))
+	((pci_domain_nr(pdev->bus) << 16) |     \
+	PCI_DEVID(pdev->bus->number, pdev->devfn))
 
 static int xocl_match_slot_and_save(struct device *dev, void *data)
 {
 	struct vmr_drvdata *vmr = data;
-        struct pci_dev *pdev;
+	struct pci_dev *pdev;
 
-        pdev = to_pci_dev(dev);
+	pdev = to_pci_dev(dev);
 
-        if ((XOCL_DEV_ID(pdev) >> 3) == (XOCL_DEV_ID(vmr->pdev) >> 3)) {
-                pci_cfg_access_lock(pdev);
-                pci_save_state(pdev);
-                xocl_save_config_space(pdev, vmr->saved_config[PCI_FUNC(pdev->devfn)]);
-        }
+	if ((XOCL_DEV_ID(pdev) >> 3) == (XOCL_DEV_ID(vmr->pdev) >> 3)) {
+		pci_cfg_access_lock(pdev);
+		pci_save_state(pdev);
+		xocl_save_config_space(pdev, vmr->saved_config[PCI_FUNC(pdev->devfn)]);
+	}
 
-        return 0;
+	return 0;
 }
 
 static void xocl_restore_config_space(struct pci_dev *pdev, u32 *config_saved)
-{       
-        int i;
-        u32 val;
-        
-        for (i = 0; i < 16; i++) {
-                pci_read_config_dword(pdev, i * 4, &val);
-                if (val == config_saved[i])
-                        continue;
-                
-                pci_write_config_dword(pdev, i * 4, config_saved[i]);
-                pci_read_config_dword(pdev, i * 4, &val);
-                if (val != config_saved[i]) {
-                	printk("DZ_ restore config at %d failed\n", i * 4);
-                }
-        }
+{
+	int i;
+	u32 val;
+
+	for (i = 0; i < 16; i++) {
+		pci_read_config_dword(pdev, i * 4, &val);
+		if (val == config_saved[i])
+			continue;
+
+		pci_write_config_dword(pdev, i * 4, config_saved[i]);
+		pci_read_config_dword(pdev, i * 4, &val);
+		if (val != config_saved[i])
+			pr_info("DZ_ restore config at %d failed\n", i * 4);
+	}
 }
 
 static int xocl_match_slot_and_restore(struct device *dev, void *data)
 {
 	struct vmr_drvdata *vmr = data;
-        struct pci_dev *pdev;
+	struct pci_dev *pdev;
 
-        pdev = to_pci_dev(dev);
+	pdev = to_pci_dev(dev);
 
-        if ((XOCL_DEV_ID(pdev) >> 3) == (XOCL_DEV_ID(vmr->pdev) >> 3)) {
-                xocl_restore_config_space(pdev, vmr->saved_config[PCI_FUNC(pdev->devfn)]);
-                pci_restore_state(pdev);
-                pci_cfg_access_unlock(pdev);
-        }
+	if ((XOCL_DEV_ID(pdev) >> 3) == (XOCL_DEV_ID(vmr->pdev) >> 3)) {
+		xocl_restore_config_space(pdev, vmr->saved_config[PCI_FUNC(pdev->devfn)]);
+		pci_restore_state(pdev);
+		pci_cfg_access_unlock(pdev);
+	}
 
-        return 0;
+	return 0;
 }
 
 static void vmgmt_reset_pci(struct vmr_drvdata *vmr)
@@ -1470,45 +1471,44 @@ static void vmgmt_reset_pci(struct vmr_drvdata *vmr)
 	pci_disable_device(pdev);
 	bus = pdev->bus;
 
-        pcie_capability_read_word(bus->self, PCI_EXP_SLTCTL, &slot_ctrl);
-        if (slot_ctrl != (u16) ~0) {
-                slot_ctrl_orig = slot_ctrl;
-                slot_ctrl &= ~(PCI_EXP_SLTCTL_HPIE);
-                pcie_capability_write_word(bus->self, PCI_EXP_SLTCTL, slot_ctrl);
-        }
-        /*
-         * When flipping the SBR bit, device can fall off the bus. This is usually
-         * no problem at all so long as drivers are working properly after SBR.
-         * However, some systems complain bitterly when the device falls off the bus.
-         * Such as a Dell Servers, The iDRAC is totally independent from the
-         * operating system; it will still reboot the machine even if the operating
-         * system ignores the error.
-         * The quick solution is to temporarily disable the SERR reporting of
-         * switch port during SBR.
-         */
-        pci_read_config_word(bus->self, PCI_COMMAND, &pci_cmd);
-        pci_write_config_word(bus->self, PCI_COMMAND, (pci_cmd & ~PCI_COMMAND_SERR));
-        pcie_capability_read_word(bus->self, PCI_EXP_DEVCTL, &devctl);
-        pcie_capability_write_word(bus->self, PCI_EXP_DEVCTL,
-                                           (devctl & ~PCI_EXP_DEVCTL_FERE));
-        
-        pci_read_config_byte(bus->self, PCI_BRIDGE_CONTROL, &pci_bctl);
-        pci_bctl |= PCI_BRIDGE_CTL_BUS_RESET;
-        pci_write_config_byte(bus->self, PCI_BRIDGE_CONTROL, pci_bctl);
-                
-        if (!slot_ctrl_orig)
-                pcie_capability_write_word(bus->self, PCI_EXP_SLTCTL, slot_ctrl_orig);
-        
-        msleep(100);
-        pci_bctl &= ~PCI_BRIDGE_CTL_BUS_RESET;
-        pci_write_config_byte(bus->self, PCI_BRIDGE_CONTROL, pci_bctl);
-        ssleep(1);
+	pcie_capability_read_word(bus->self, PCI_EXP_SLTCTL, &slot_ctrl);
+	if (slot_ctrl != (u16)~0) {
+		slot_ctrl_orig = slot_ctrl;
+		slot_ctrl &= ~(PCI_EXP_SLTCTL_HPIE);
+		pcie_capability_write_word(bus->self, PCI_EXP_SLTCTL, slot_ctrl);
+	}
+	/*
+	 * When flipping the SBR bit, device can fall off the bus. This is usually
+	 * no problem at all so long as drivers are working properly after SBR.
+	 * However, some systems complain bitterly when the device falls off the bus.
+	 * Such as a Dell Servers, The iDRAC is totally independent from the
+	 * operating system; it will still reboot the machine even if the operating
+	 * system ignores the error.
+	 * The quick solution is to temporarily disable the SERR reporting of
+	 * switch port during SBR.
+	 */
+	pci_read_config_word(bus->self, PCI_COMMAND, &pci_cmd);
+	pci_write_config_word(bus->self, PCI_COMMAND, (pci_cmd & ~PCI_COMMAND_SERR));
+	pcie_capability_read_word(bus->self, PCI_EXP_DEVCTL, &devctl);
+	pcie_capability_write_word(bus->self, PCI_EXP_DEVCTL, (devctl & ~PCI_EXP_DEVCTL_FERE));
 
-        pcie_capability_write_word(bus->self, PCI_EXP_DEVCTL, devctl);
-        pci_write_config_word(bus->self, PCI_COMMAND, pci_cmd);
+	pci_read_config_byte(bus->self, PCI_BRIDGE_CONTROL, &pci_bctl);
+	pci_bctl |= PCI_BRIDGE_CTL_BUS_RESET;
+	pci_write_config_byte(bus->self, PCI_BRIDGE_CONTROL, pci_bctl);
 
-        if (pci_enable_device(pdev))
-                VMR_ERR(vmr, "failed to enable pci device");
+	if (!slot_ctrl_orig)
+		pcie_capability_write_word(bus->self, PCI_EXP_SLTCTL, slot_ctrl_orig);
+
+	msleep(100);
+	pci_bctl &= ~PCI_BRIDGE_CTL_BUS_RESET;
+	pci_write_config_byte(bus->self, PCI_BRIDGE_CONTROL, pci_bctl);
+	ssleep(1);
+
+	pcie_capability_write_word(bus->self, PCI_EXP_DEVCTL, devctl);
+	pci_write_config_word(bus->self, PCI_COMMAND, pci_cmd);
+
+	if (pci_enable_device(pdev))
+		VMR_ERR(vmr, "failed to enable pci device");
 
 	xocl_wait_pci_status(pdev, 0, 0, 0);
 
@@ -1543,6 +1543,9 @@ void comms_chan_send_response(struct comms_chan *comms, struct comms_msg *msg)
 		size = comms_chan_get_xclbin_uuid(comms->vmr, response.body.payload);
 		break;
 	case COMMS_REQ_OPS_HOT_RESET:
+		// enable_vmr_boot
+		// offline vmr_services
+		// xclmgmt_reset_pci
 		VMR_WARN(comms->vmr, "Trying to reset card in slot %s:%02x:%lx",
 			 pdev->bus->name, PCI_SLOT(pdev->devfn), PCI_FUNC(pdev->devfn));
 
@@ -1875,7 +1878,7 @@ static int vmr_char_create(struct vmr_drvdata *vmr)
 		return -ENODEV;
 	}
 
-	devid = PCI_DEVID(vmr->pdev->bus->number,vmr->pdev->devfn);
+	devid = PCI_DEVID(vmr->pdev->bus->number, vmr->pdev->devfn);
 	vmr_char->sys_device = device_create(vmgmt_class, &vmr->pdev->dev,
 					     vmr_char->cdev.dev, NULL, "%s%x",
 					     DRV_NAME, devid);
@@ -2041,7 +2044,8 @@ static int versal_mgmt_probe(struct pci_dev *pdev,
 	}
 
 	/*TODO: cleanup iomap bars, using regular ioremap and ioremap_wc for
-	 * shared memory buffer to get better performance */
+	 * shared memory buffer to get better performance
+	 */
 	bar_mask = pci_select_bars(pdev, IORESOURCE_MEM);
 	ret = pcim_iomap_regions(pdev, bar_mask, "versal-mgmt");
 	if (ret) {
@@ -2155,7 +2159,7 @@ static int __init versal_mgmt_init(void)
 {
 	int ret;
 
-	pr_info(DRV_NAME " init()\n");
+	pr_info(" init()\n");
 
 	vmgmt_class = class_create(CLASS_NAME);
 	if (IS_ERR(vmgmt_class))
@@ -2181,7 +2185,7 @@ alloc_err:
 
 static void versal_mgmt_exit(void)
 {
-	pr_info(DRV_NAME" exit()\n");
+	pr_info(DRV_NAME " exit()\n");
 	pci_unregister_driver(&versal_mgmt_driver);
 	unregister_chrdev_region(vmgmt_devnode, MAX_DEVICES);
 	class_destroy(vmgmt_class);
