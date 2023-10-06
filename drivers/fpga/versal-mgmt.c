@@ -95,6 +95,7 @@
 #define VMR_LOG_PAGE_NUM		1
 #define VMR_LOG_ADDR_OFF		0x0
 #define VMR_DATA_ADDR_OFF		(VMR_LOG_PAGE_SIZE * VMR_LOG_PAGE_NUM)
+#define VMR_LOG_MAXLEN			0x100
 
 #define VMR_INFO(vmr, fmt, args...)	dev_info(&(vmr)->pdev->dev, "%s: "fmt, __func__, ##args)
 #define VMR_WARN(vmr, fmt, args...)	dev_warn(&(vmr)->pdev->dev, "%s: "fmt, __func__, ##args)
@@ -102,6 +103,10 @@
 #define VMR_DBG(vmr, fmt, args...)	dev_dbg(&(vmr)->pdev->dev, "%s: "fmt, __func__, ##args)
 
 #define ICAP_XCLBIN_V2			"xclbin2"
+
+int health_interval;
+module_param(health_interval, int, 0644);
+MODULE_PARM_DESC(health_interval, "Health check interval in seconds, range (1 minium - 5 default)");
 
 struct vmr_drvdata;
 
@@ -235,12 +240,15 @@ struct vmr_drvdata {
 	struct vmr_shared_mem	xgq_vmr_shared_mem;
 	struct list_head	xgq_submitted_cmds;
 	struct xgq_worker	xgq_complete_worker;
+	struct xgq_worker	xgq_health_worker;
 	bool			xgq_halted;
 	struct semaphore	xgq_data_sema;
 	struct semaphore	xgq_log_page_sema;
 	struct xgq_cmd_cq_default_payload xgq_cq_payload;
 	int			xgq_vmr_debug_level;
 	bool			xgq_vmr_program;
+	int			xgq_vmr_need_hot_reset;
+
 	uuid_t			xclbin_uuid;
 	uuid_t			intf_uuid;
 	void __iomem		*comms_chan_base;
@@ -276,6 +284,7 @@ static const enum xgq_cmd_opcode opcode[] = {
 };
 
 static void vmr_offline_services(struct vmr_drvdata *vmr);
+static int xgq_log_page_af(struct vmr_drvdata *vmr);
 
 static inline void vmr_memcpy_toio32(void *dst, void *buf, u32 size)
 {
@@ -354,6 +363,23 @@ static void cmd_complete(struct vmr_drvdata *vmr, struct xgq_com_queue_entry *cc
 	}
 }
 
+static int vmr_health_check(struct vmr_drvdata *vmr)
+{
+	int tripped = 0;
+
+	if (!health_interval)
+		return 0;
+
+	/*TODO: should we check VMR and APU healthy here? */
+
+	tripped = xgq_log_page_af(vmr);
+
+	if (tripped)
+		VMR_ERR(vmr, "Card is in Bad state, please request pci hot reset");
+
+	return tripped;
+}
+
 static int complete_worker(void *data)
 {
 	struct xgq_worker *xw = (struct xgq_worker *)data;
@@ -399,10 +425,41 @@ static int complete_worker(void *data)
 	return xw->error ? 1 : 0;
 }
 
+static int health_worker(void *data)
+{
+	struct xgq_worker *xw = (struct xgq_worker *)data;
+	struct vmr_drvdata *vmr = xw->xgq_vmr;
+
+	while (!xw->stop) {
+		msleep(health_interval * 1000);
+
+		if (vmr_health_check(vmr))
+			vmr->xgq_vmr_need_hot_reset = 1;
+
+		if (kthread_should_stop())
+			xw->stop = true;
+	}
+
+	return xw->error ? 1 : 0;
+}
+
 static int init_complete_worker(struct xgq_worker *xw)
 {
 	xw->complete_thread =
 		kthread_run(complete_worker, (void *)xw, "complete worker");
+
+	if (IS_ERR(xw->complete_thread))
+		return PTR_ERR(xw->complete_thread);
+
+	return 0;
+}
+
+static int init_health_worker(struct xgq_worker *xw)
+{
+	health_interval = 5;
+
+	xw->complete_thread =
+		kthread_run(health_worker, (void *)xw, "health worker");
 
 	if (IS_ERR(xw->complete_thread))
 		return PTR_ERR(xw->complete_thread);
@@ -857,6 +914,77 @@ static int vmr_transfer_data_impl(struct vmr_drvdata *vmr, char *buf, size_t len
 
 	VMR_INFO(vmr, "successfully download len %ld", len);
 	return 0;
+}
+
+static int xgq_log_page_af(struct vmr_drvdata *vmr)
+{
+	struct vmr_cmd *cmd = NULL;
+	struct xgq_cmd_cq_log_page_payload *log = NULL;
+	int ret = 0;
+	int id = 0;
+	u32 address = 0;
+	u32 len = 0;
+	u32 log_size = 0;
+
+	ret = vmr_create_cmd(vmr, XGQ_CMD_OP_GET_LOG_PAGE, &cmd, &id, XGQ_CONFIG_TIME);
+	if (ret)
+		return ret;
+
+	ret = vmr_log_payload_init(vmr, cmd, XGQ_CMD_LOG_AF_CHECK, 0, 0, &address, &len);
+	if (ret) {
+		vmr_remove_cmd(vmr, cmd, id);
+		return ret;
+	}
+
+	ret = vmr_submit_cmd(vmr, cmd);
+	if (ret) {
+		VMR_ERR(vmr, "submit cmd failed, cid %d", id);
+		goto done;
+	}
+
+	/* wait for command completion */
+	if (wait_for_completion_killable(&cmd->xgq_cmd_complete)) {
+		VMR_ERR(vmr, "submitted cmd killed");
+		vmr_submitted_cmd_remove(vmr, cmd);
+		/* this is not a firewall trip */
+		ret = 0;
+		goto done;
+	}
+
+	ret = cmd->xgq_cmd_rcode;
+
+	if (ret == -ETIME || ret == -EINVAL)
+		ret = 0;
+
+	/*
+	 * No matter ret is 0 or not, the device might return error messages.
+	 */
+	log = (struct xgq_cmd_cq_log_page_payload *)&cmd->xgq_cmd_cq_payload;
+	log_size = log->count;
+	if (log_size > len) {
+		VMR_WARN(vmr, "return log size %d is greater than request %d",
+			 log->count, len);
+		log_size = len;
+	}
+
+	if (log_size > 0 && log_size < VMR_LOG_MAXLEN) {
+		char *log_msg = vmalloc(log_size + 1);
+		if (!log_msg) {
+			VMR_ERR(vmr, "vmalloc failed to find %d memory", log_size + 1);
+			goto done;
+		}
+		memcpy_from_device(vmr, address, log_msg, log_size);
+		log_msg[log_size] = '\0';
+
+		VMR_ERR(vmr, "%s", log_msg);
+		vfree(log_msg);
+	}
+
+done:
+	vmr_log_payload_fini(vmr);
+	vmr_remove_cmd(vmr, cmd, id);
+
+	return ret;
 }
 
 static int xgq_log_page_fw(struct vmr_drvdata *vmr, char **fw, size_t *fw_size,
@@ -1389,6 +1517,16 @@ static void vmgmt_reset_pci(struct vmr_drvdata *vmr)
 	/*TODO: config pci */
 }
 
+void vmgmt_hot_reset(struct vmr_drvdata *vmr)
+{
+	VMR_WARN(vmr, "start hot_reset");
+	enable_vmr_boot(vmr);
+	vmr_stop_services(vmr);
+	vmgmt_reset_pci(vmr);
+	vmr_start_services(vmr);
+	VMR_WARN(vmr, "done hot_reset");
+}
+
 void comms_chan_send_response(struct comms_chan *comms, struct comms_msg *msg)
 {
 	struct pci_dev *pdev = comms->vmr->pdev;
@@ -1405,15 +1543,11 @@ void comms_chan_send_response(struct comms_chan *comms, struct comms_msg *msg)
 		size = comms_chan_get_xclbin_uuid(comms->vmr, response.body.payload);
 		break;
 	case COMMS_REQ_OPS_HOT_RESET:
-		// enable_vmr_boot
-		// offline vmr_services
-		// xclmgmt_reset_pci 
 		VMR_WARN(comms->vmr, "Trying to reset card in slot %s:%02x:%lx",
 			 pdev->bus->name, PCI_SLOT(pdev->devfn), PCI_FUNC(pdev->devfn));
-		enable_vmr_boot(comms->vmr);
-		vmr_stop_services(comms->vmr);
-		vmgmt_reset_pci(comms->vmr);
-		vmr_start_services(comms->vmr);
+
+		vmgmt_hot_reset(comms->vmr);
+
 		*response.body.payload = 0;
 		size = sizeof(int);
 		break;
@@ -1854,6 +1988,7 @@ static void versal_mgmt_remove(struct pci_dev *pdev)
 	vmr_char_destroy(vmr);
 	vmr_stop_services(vmr);
 	fini_worker(&vmr->xgq_complete_worker);
+	fini_worker(&vmr->xgq_health_worker);
 	idr_destroy(&vmr->xgq_vmr_cid_idr);
 
 	/* TODO: iounmap bars? */
@@ -1936,7 +2071,9 @@ static int versal_mgmt_probe(struct pci_dev *pdev,
 	INIT_LIST_HEAD(&vmr->xgq_submitted_cmds);
 
 	vmr->xgq_complete_worker.xgq_vmr = vmr;
+	vmr->xgq_health_worker.xgq_vmr = vmr;
 	init_complete_worker(&vmr->xgq_complete_worker);
+	init_health_worker(&vmr->xgq_health_worker);
 
 	(void)vmr_services_probe(vmr);
 	pci_set_drvdata(pdev, vmr);
