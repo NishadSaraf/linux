@@ -474,6 +474,13 @@ static int fini_worker(struct xgq_worker *xw)
 	return kthread_stop(xw->complete_thread);
 };
 
+/*
+ * VMR basic ops checker
+ *
+ * The basic OP commands functionality for Identify OP and
+ * Flash OP is restricted to be strictly unmodified to
+ * ensure backward compatibility with older shell versions.
+ */
 static bool vmr_xgq_basic_op(struct vmr_cmd *cmd)
 {
 	int i;
