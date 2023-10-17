@@ -6,8 +6,8 @@
  * Header file for Accelerated FPGA Versal Boards
  */
 
-#ifndef __XGQ_CMD_H
-#define __XGQ_CMD_H
+#ifndef _VMGMT_XGQ_CMD_H
+#define _VMGMT_XGQ_CMD_H
 #include <linux/types.h>
 
 /* preprocessors and definitions */
@@ -384,4 +384,3 @@ void xgq_notify_peer_consumed(struct xgq *xgq);
 int xgq_attach(struct xgq *xgq, uint64_t flags, uint64_t io_hdl, uint64_t ring_addr,
                              uint64_t sq_produced, uint64_t cq_produced);
 #endif
-

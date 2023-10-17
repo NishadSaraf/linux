@@ -2,7 +2,7 @@
 #include <linux/module.h>
 #include <linux/types.h>
 
-#include "xgq_cmd.h"
+#include "vmgmt_xgq_cmd.h"
 
 #define XGQ_TRUE        1
 #define XGQ_FALSE       0

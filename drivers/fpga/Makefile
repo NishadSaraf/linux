@@ -50,7 +50,7 @@ dfl-fme-objs := dfl-fme-main.o dfl-fme-pr.o dfl-fme-error.o
 dfl-fme-objs += dfl-fme-perf.o
 dfl-afu-objs := dfl-afu-main.o dfl-afu-region.o dfl-afu-dma-region.o
 dfl-afu-objs += dfl-afu-error.o
-vmgmt-objs := xgq_cmd.o versal-mgmt.o
+vmgmt-objs := vmgmt_reset.o vmgmt_xgq_cmd.o vmgmt_main.o
 
 obj-$(CONFIG_FPGA_DFL_NIOS_INTEL_PAC_N3000)	+= dfl-n3000-nios.o
 

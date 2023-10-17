@@ -27,9 +27,8 @@
 #include <linux/vmgmt.h>
 #include <linux/module.h>
 
-//#define XGQ_IMPL
-#include "xgq_cmd.h"
-//#include "xgq_impl.h"
+#include "vmgmt_xgq_cmd.h"
+#include "vmgmt_common.h"
 
 #define MAX_DEVICES		24
 #define DRV_VERSION		"0.1"
@@ -374,10 +373,11 @@ static int vmr_health_check(struct vmr_drvdata *vmr)
 
 	/*TODO: should we check VMR and APU healthy here? */
 
+#if 0
 	tripped = xgq_log_page_af(vmr);
-
 	if (tripped)
 		VMR_ERR(vmr, "Card is in Bad state, please request pci hot reset");
+#endif
 
 	return tripped;
 }
@@ -854,6 +854,24 @@ static inline int valid_data_opcode(int opcode)
 	return -EINVAL;
 }
 
+static int vmr_wait_not_killable(struct vmr_cmd *cmd)
+{
+	/*
+	 * For pdi/xclbin data transfer, we block any cancellation and
+	 * wait till command completed and then release resources safely.
+	 * We call cond_resched after every timeout to avoid linux kernel
+	 * warning for thread hanging too long.
+	 *
+	 * The health thread will check if any command jiffies are due and
+	 * clean the pending command.
+	 */
+	while (!wait_for_completion_timeout(&cmd->xgq_cmd_complete, XGQ_WAIT_TIMEOUT))
+		cond_resched();
+
+	/* rcode 0 means succeeded, otherwise an error */
+	return cmd->xgq_cmd_rcode;
+}
+
 static int vmr_transfer_data(struct vmr_drvdata *vmr, const void *buf, u32 len, u64 priv,
 			     enum xgq_cmd_opcode opcode, u32 timer)
 {
@@ -882,14 +900,7 @@ static int vmr_transfer_data(struct vmr_drvdata *vmr, const void *buf, u32 len, 
 		goto done;
 	}
 
-	/*
-	 * For pdi/xclbin data transfer, we block any cancellation and
-	 * wait till command completed and then release resources safely.
-	 * We call cond_resched after every timeout to avoid linux kernel
-	 * warning for thread hanging too long.
-	 */
-	while (!wait_for_completion_timeout(&cmd->xgq_cmd_complete, XGQ_WAIT_TIMEOUT))
-		cond_resched();
+	vmr_wait_not_killable(cmd);
 
 	/* If return is 0, we set length as return value */
 	if (cmd->xgq_cmd_rcode)
@@ -1370,159 +1381,12 @@ static int enable_vmr_boot(struct vmr_drvdata *vmr)
 	return 0;
 }
 
-int xocl_wait_pci_status(struct pci_dev *pdev, u16 mask, u16 val, int timeout)
-{
-	u16     pci_cmd;
-	int     i;
-
-	if (!timeout)
-		timeout = 5000;
-	else
-		timeout *= 1000;
-
-	for (i = 0; i < timeout; i++) {
-		pci_read_config_word(pdev, PCI_COMMAND, &pci_cmd);
-		if (pci_cmd != 0xffff && (pci_cmd & mask) == val)
-			break;
-		usleep_range(1000, 1001);
-	}
-
-	pr_info("DZ_ waiting for %d ms\n", i);
-	if (i == timeout)
-		return -ETIME;
-
-	return 0;
-}
-
-static void xocl_save_config_space(struct pci_dev *pdev, u32 *saved_config)
-{
-	int i;
-
-	for (i = 0; i < 16; i++)
-		pci_read_config_dword(pdev, i * 4, &saved_config[i]);
-}
-
-#define XOCL_DEV_ID(pdev)                       \
-	((pci_domain_nr(pdev->bus) << 16) |     \
-	PCI_DEVID(pdev->bus->number, pdev->devfn))
-
-static int xocl_match_slot_and_save(struct device *dev, void *data)
-{
-	struct vmr_drvdata *vmr = data;
-	struct pci_dev *pdev;
-
-	pdev = to_pci_dev(dev);
-
-	if ((XOCL_DEV_ID(pdev) >> 3) == (XOCL_DEV_ID(vmr->pdev) >> 3)) {
-		pci_cfg_access_lock(pdev);
-		pci_save_state(pdev);
-		xocl_save_config_space(pdev, vmr->saved_config[PCI_FUNC(pdev->devfn)]);
-	}
-
-	return 0;
-}
-
-static void xocl_restore_config_space(struct pci_dev *pdev, u32 *config_saved)
-{
-	int i;
-	u32 val;
-
-	for (i = 0; i < 16; i++) {
-		pci_read_config_dword(pdev, i * 4, &val);
-		if (val == config_saved[i])
-			continue;
-
-		pci_write_config_dword(pdev, i * 4, config_saved[i]);
-		pci_read_config_dword(pdev, i * 4, &val);
-		if (val != config_saved[i])
-			pr_info("DZ_ restore config at %d failed\n", i * 4);
-	}
-}
-
-static int xocl_match_slot_and_restore(struct device *dev, void *data)
-{
-	struct vmr_drvdata *vmr = data;
-	struct pci_dev *pdev;
-
-	pdev = to_pci_dev(dev);
-
-	if ((XOCL_DEV_ID(pdev) >> 3) == (XOCL_DEV_ID(vmr->pdev) >> 3)) {
-		xocl_restore_config_space(pdev, vmr->saved_config[PCI_FUNC(pdev->devfn)]);
-		pci_restore_state(pdev);
-		pci_cfg_access_unlock(pdev);
-	}
-
-	return 0;
-}
-
-static void vmgmt_reset_pci(struct vmr_drvdata *vmr)
-{
-	struct pci_dev *pdev = vmr->pdev;
-	struct pci_bus *bus;
-	u16 slot_ctrl_orig = 0, slot_ctrl;
-	u8 pci_bctl;
-	u16 pci_cmd, devctl;
-
-	VMR_WARN(vmr, "Reset PCI");
-
-	/*TODO: pci_save_config_all */
-	bus_for_each_dev(&pci_bus_type, NULL, vmr, xocl_match_slot_and_save);
-
-	pci_disable_device(pdev);
-	bus = pdev->bus;
-
-	pcie_capability_read_word(bus->self, PCI_EXP_SLTCTL, &slot_ctrl);
-	if (slot_ctrl != (u16)~0) {
-		slot_ctrl_orig = slot_ctrl;
-		slot_ctrl &= ~(PCI_EXP_SLTCTL_HPIE);
-		pcie_capability_write_word(bus->self, PCI_EXP_SLTCTL, slot_ctrl);
-	}
-	/*
-	 * When flipping the SBR bit, device can fall off the bus. This is usually
-	 * no problem at all so long as drivers are working properly after SBR.
-	 * However, some systems complain bitterly when the device falls off the bus.
-	 * Such as a Dell Servers, The iDRAC is totally independent from the
-	 * operating system; it will still reboot the machine even if the operating
-	 * system ignores the error.
-	 * The quick solution is to temporarily disable the SERR reporting of
-	 * switch port during SBR.
-	 */
-	pci_read_config_word(bus->self, PCI_COMMAND, &pci_cmd);
-	pci_write_config_word(bus->self, PCI_COMMAND, (pci_cmd & ~PCI_COMMAND_SERR));
-	pcie_capability_read_word(bus->self, PCI_EXP_DEVCTL, &devctl);
-	pcie_capability_write_word(bus->self, PCI_EXP_DEVCTL, (devctl & ~PCI_EXP_DEVCTL_FERE));
-
-	pci_read_config_byte(bus->self, PCI_BRIDGE_CONTROL, &pci_bctl);
-	pci_bctl |= PCI_BRIDGE_CTL_BUS_RESET;
-	pci_write_config_byte(bus->self, PCI_BRIDGE_CONTROL, pci_bctl);
-
-	if (!slot_ctrl_orig)
-		pcie_capability_write_word(bus->self, PCI_EXP_SLTCTL, slot_ctrl_orig);
-
-	msleep(100);
-	pci_bctl &= ~PCI_BRIDGE_CTL_BUS_RESET;
-	pci_write_config_byte(bus->self, PCI_BRIDGE_CONTROL, pci_bctl);
-	ssleep(1);
-
-	pcie_capability_write_word(bus->self, PCI_EXP_DEVCTL, devctl);
-	pci_write_config_word(bus->self, PCI_COMMAND, pci_cmd);
-
-	if (pci_enable_device(pdev))
-		VMR_ERR(vmr, "failed to enable pci device");
-
-	xocl_wait_pci_status(pdev, 0, 0, 0);
-
-	bus_for_each_dev(&pci_bus_type, NULL, vmr, xocl_match_slot_and_restore);
-
-	/*TODO: config pci */
-}
-
-void vmgmt_hot_reset(struct vmr_drvdata *vmr)
+static void vmgmt_hot_reset(struct vmr_drvdata *vmr)
 {
 	VMR_WARN(vmr, "start hot_reset");
 	enable_vmr_boot(vmr);
 	vmr_stop_services(vmr);
-	vmgmt_reset_pci(vmr);
+	vmgmt_reset_pci(vmr->pdev);
 	vmr_start_services(vmr);
 	VMR_WARN(vmr, "done hot_reset");
 }
@@ -1707,6 +1571,7 @@ static int vmr_char_close(struct inode *inode, struct file *filep)
 struct vmr_region_match_arg {
 	struct vmr_drvdata *vmr;
 	uuid_t *uuid;
+	bool skip;
 };
 
 static int vmr_region_match(struct device *dev, const void *data)
@@ -1722,7 +1587,7 @@ static int vmr_region_match(struct device *dev, const void *data)
 	match_region = to_fpga_region(dev);
 
 	import_uuid(&compat_uuid, (const char *)match_region->compat_id);
-	if (uuid_equal(&compat_uuid, arg->uuid)) {
+	if (arg->skip || uuid_equal(&compat_uuid, arg->uuid)) {
 		VMR_INFO(vmr, "Region match found");
 		return true;
 	}
@@ -1806,9 +1671,11 @@ static long vmr_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 	switch (cmd) {
 	case VERSAL_MGMT_LOAD_XCLBIN_IOCTL:
 		vmr->fw_tnx.opcode = XGQ_CMD_OP_LOAD_XCLBIN;
+		reg.skip = false;
 		break;
 	case VERSAL_MGMT_PROGRAM_SHELL_IOCTL:
 		vmr->fw_tnx.opcode = XGQ_CMD_OP_DOWNLOAD_PDI;
+		reg.skip = true;
 		break;
 	default:
 		VMR_ERR(vmr, "Invalid IOCTL command: %d", cmd);
@@ -1945,8 +1812,7 @@ static int versal_fpga_write_complete(struct fpga_manager *mgr,
 		goto done;
 	}
 
-	ret = wait_for_completion_timeout(&vmr->fw_tnx.cmd->xgq_cmd_complete,
-					  XGQ_WAIT_TIMEOUT);
+	ret = vmr_wait_not_killable(vmr->fw_tnx.cmd);
 	if (!ret) {
 		VMR_ERR(vmr, "Image download timed out");
 		ret = -ETIMEDOUT;
