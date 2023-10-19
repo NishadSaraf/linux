@@ -26,6 +26,7 @@
 #include <linux/xclbin.h>
 #include <linux/vmgmt.h>
 #include <linux/module.h>
+#include <linux/debugfs.h>
 
 #include "vmgmt_xgq_cmd.h"
 #include "vmgmt_common.h"
@@ -262,6 +263,7 @@ struct vmr_drvdata {
 	struct vmr_fw_tnx	fw_tnx;
 
 	u32			saved_config[8][16]; /* save config for pci reset */
+	void			*debugfs_root;
 };
 
 static const struct pci_device_id versal_mgmt_id_tbl[] = {
@@ -373,8 +375,8 @@ static int vmr_health_check(struct vmr_drvdata *vmr)
 
 	/*TODO: should we check VMR and APU healthy here? */
 
-#if 0
 	tripped = xgq_log_page_af(vmr);
+#if 0
 	if (tripped)
 		VMR_ERR(vmr, "Card is in Bad state, please request pci hot reset");
 #endif
@@ -1184,6 +1186,45 @@ static int vmr_status_query(struct vmr_drvdata *vmr)
 	return vmr_control_op(vmr, XGQ_CMD_VMR_QUERY);
 }
 
+static int vmgmt_vmr_debug_level_buf_get(struct vmr_drvdata *vmr, char **buf, u32 *len)
+{
+	*len = 10;
+	*buf = vmalloc(*len);
+	if (!(*buf))
+		return -ENOMEM;
+
+	snprintf(*buf, *len, "%d\n", vmr->xgq_vmr_debug_level);
+
+	return 0;
+}
+
+static int vmgmt_vmr_log_buf_get(struct vmr_drvdata *vmr, char **buf, u32 *len)
+{
+	return -EINVAL;
+}
+
+int vmgmt_log_buf_get(struct vmr_drvdata *vmr, enum log_type lt, char **buf, u32 *len)
+{
+	if (lt == LT_VMR_DBG_LEVEL)
+		return vmgmt_vmr_debug_level_buf_get(vmr, buf, len);
+	else if (lt == LT_VMR_LOG)
+		return vmgmt_vmr_log_buf_get(vmr, buf, len);
+	else
+		return -EINVAL;
+}
+
+int vmgmt_log_val_set(struct vmr_drvdata *vmr, enum log_type lt, u32 val)
+{
+	if (lt != LT_VMR_DBG_LEVEL)
+		return -EINVAL;
+
+	mutex_lock(&vmr->xgq_lock);
+	vmr->xgq_vmr_debug_level = val;
+	mutex_unlock(&vmr->xgq_lock);
+
+	return vmr_status_query(vmr);
+}
+
 static bool vmr_check_apu_is_ready(struct vmr_drvdata *vmr)
 {
 	struct xgq_cmd_cq_vmr_payload *vmr_status =
@@ -1421,7 +1462,7 @@ void comms_chan_send_response(struct comms_chan *comms, struct comms_msg *msg)
 		// enable_vmr_boot
 		// offline vmr_services
 		// xclmgmt_reset_pci
-		VMR_WARN(comms->vmr, "Trying to reset card in slot %s:%02x:%lx",
+		VMR_WARN(comms->vmr, "Trying to reset card in slot %s:%02x:%x",
 			 pdev->bus->name, PCI_SLOT(pdev->devfn), PCI_FUNC(pdev->devfn));
 
 		vmgmt_hot_reset(comms->vmr);
@@ -1859,6 +1900,8 @@ static void versal_mgmt_remove(struct pci_dev *pdev)
 {
 	struct vmr_drvdata *vmr = pci_get_drvdata(pdev);
 
+	vmgmt_debugfs_fini(vmr->debugfs_root);
+
 	if (vmr->bridge)
 		fpga_bridge_unregister(vmr->bridge);
 	if (vmr->region)
@@ -2003,6 +2046,9 @@ static int versal_mgmt_probe(struct pci_dev *pdev,
 		vmr->region = NULL;
 		goto fpga_region_failed;
 	}
+
+	vmr->debugfs_root =
+		vmgmt_debugfs_init(vmr, dev_name(vmr->char_dev.sys_device));
 
 	VMR_INFO(vmr, "succeeded");
 	return 0;
