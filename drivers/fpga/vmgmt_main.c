@@ -679,7 +679,9 @@ static int vmr_data_payload_init(struct vmr_drvdata *vmr, struct vmr_cmd *cmd, i
 
 	payload->address = address;
 	payload->size = req_len;
-	payload->flash_type = XGQ_CMD_FLASH_DEFAULT;
+	/* Clear Bits of given mask */
+	payload->flash_type &= ~XGQ_MASK_FLASH_TYPE;
+	payload->flash_type |= FIELD_PREP(XGQ_MASK_FLASH_TYPE,XGQ_CMD_FLASH_DEFAULT);
 	payload->priv = priv;
 
 	/* update payload size in hdr */
@@ -718,7 +720,9 @@ static int vmr_log_payload_init(struct vmr_drvdata *vmr, struct vmr_cmd *cmd,
 	payload->address = address;
 	payload->size = req_len ? req_len : length; // if req_len is 0, use entire length
 	payload->offset = off;
-	payload->pid = req_pid;
+	/* Clear Bits of given mask */
+	payload->pid &= ~XGQ_MASK_PID;
+	payload->pid |= FIELD_PREP(XGQ_MASK_PID,req_pid);
 
 	/* update payload size in hdr */
 	hdr = &cmd->xgq_cmd_entry.hdr;

@@ -26,6 +26,11 @@
 #define XGQ_ENTRY_NEW_FLAG_MASK         0x80000000
 #define XGQ_COM_Q1_SLOT_SIZE    (sizeof(struct xgq_com_queue_entry)) // NOLINT
 
+/*Structure data field masks*/
+#define XGQ_MASK_FLASH_TYPE	GENMASK(7,4)
+#define XGQ_MASK_PID		GENMASK(15,0)
+#define ONE_QUAD_WORD_OFFSET	(8)
+
 /*TO DO:- Host driver is client and the SERVER macro should be removed; */
 /* enumerations and definitions */
 
@@ -92,16 +97,17 @@ enum xgq_cmd_log_page_type {
  *
  * @address: data that needs to be transferred
  * @size: data size
- * @addr_type: address_type
+ * @flash_type: flash_type Default,No Backup or Legacy
+ * ----flash_type field encoding-----
+ * | rsvd1 | flash_type | addr_type |
+ * +--------------------------------+
+ * | 31---8| 7--------4 | 3-------0 |
  */
-/* TO DO:- Bit field masking needs to be exclusively defined for bit mapping*/
 struct xgq_cmd_data_payload {
 	u64 address;
 	u32 size;
 	u32 remain_size;
-	u32 addr_type:4;
-	u32 flash_type:4;
-	u32 rsvd1:24;
+	u32 flash_type;
 	u32 pad1;
 	u64 priv;
 };
@@ -113,7 +119,10 @@ struct xgq_cmd_data_payload {
  * @size:       size of pre-allocated log data
  * @offset:     offset of returned device data
  * @pid:        log_page page id
- * @addr_type:  pre-allocated address type
+ * ------pid field encoding------
+ * |  rsvd1 | addr_type |  pid  |
+ * +---------------------------+
+ * | 31---19| 18-----16 | 15--0 |
  *
  * This payload is used for log_page and sensor data report.
  */
@@ -122,10 +131,8 @@ struct xgq_cmd_log_payload {
         u64 address;
         u32 size;
         u32 offset;
-        u32 pid:16;
-        u32 addr_type:3;
-        u32 rsvd1:13;
-        u32 pad;
+	u32 pid;
+	u32 pad;
 };
 
 /**
