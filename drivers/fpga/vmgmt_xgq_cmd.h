@@ -340,6 +340,14 @@ struct vmr_shared_mem {
 	u32	vmr_data_end;
 };
 
+#define VMR_MAGIC_NO		0x564D5230 /* VMR0 */
+#define VMR_LOG_ENTRY_SIZE	(96)
+#define VMR_LOG_MAX_RECS	(50)
+
+struct vmr_log {
+        char    log_buf[VMR_LOG_ENTRY_SIZE];
+};
+
 struct xgq_com_queue_entry {
 	union {
 		struct {

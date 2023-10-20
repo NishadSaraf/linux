@@ -1186,6 +1186,68 @@ static int vmr_status_query(struct vmr_drvdata *vmr)
 	return vmr_control_op(vmr, XGQ_CMD_VMR_QUERY);
 }
 
+static int vmr_log_dump_to_dmesg(struct vmr_drvdata *vmr, char *buf, char *log_buf)
+{
+	VMR_WARN(vmr, "%s", log_buf);
+	return 0;
+}
+
+static int vmr_log_dump_to_buf(struct vmr_drvdata *vmr, char *buf, char *log_buf)
+{       
+	return buf == NULL ? 0 : snprintf(buf, PAGE_SIZE, "%s\n", log_buf);
+}
+
+static size_t vmr_log_dump_impl(struct vmr_drvdata *vmr, int num_recs, char *buf,
+        int(*dump_cb)(struct vmr_drvdata *vmr, char *buf, char *log_buf))
+{
+	struct vmr_log log = { 0 };
+	size_t count = 0;
+
+	if (num_recs > VMR_LOG_MAX_RECS)
+		num_recs = VMR_LOG_MAX_RECS;
+
+	vmr_memcpy_fromio(&vmr->xgq_vmr_shared_mem, vmr->xgq_payload_base,
+                sizeof(vmr->xgq_vmr_shared_mem));
+
+	/*
+	 * log_msg_index which is the oldest log in a ring buffer.
+	 * if we want to only dump num_recs, we start from
+	 * (log_msg_index + VMR_LOG_MAX_RECS - num_recs) % VMR_LOG_MAX_RECS.
+	 */
+	if (vmr->xgq_vmr_shared_mem.vmr_magic_no == VMR_MAGIC_NO) {
+		u32 idx, log_idx = vmr->xgq_vmr_shared_mem.log_msg_index;
+
+		log_idx = (log_idx + VMR_LOG_MAX_RECS - num_recs) % VMR_LOG_MAX_RECS;
+
+		for (idx = 0; idx < num_recs; idx++) {
+			vmr_memcpy_fromio(&log.log_buf, vmr->xgq_payload_base +
+				vmr->xgq_vmr_shared_mem.log_msg_buf_off +
+				sizeof(log) * log_idx,
+				sizeof(log));
+			log_idx = (log_idx + 1) % VMR_LOG_MAX_RECS;
+			if((PAGE_SIZE - count) < sizeof(log.log_buf)){
+				VMR_WARN(vmr, "Ignoring messages size %ld exceeds page %ld",
+					count, PAGE_SIZE);
+				break;
+			}
+
+			/* calling call back function */
+			count += dump_cb(vmr, buf ? buf + count : NULL, log.log_buf);
+		}
+	} else {
+		VMR_WARN(vmr, "vmr payload partition table is not available");
+	}
+
+	return min(count, PAGE_SIZE);
+}
+
+static void vmr_log_dump_all(struct vmr_drvdata *vmr)
+{
+	VMR_WARN(vmr, "=== start dumping vmr log===");
+	vmr_log_dump_impl(vmr, VMR_LOG_MAX_RECS, NULL, vmr_log_dump_to_dmesg);
+	VMR_WARN(vmr, "=== end dumping vmr log===");
+}
+
 static int vmgmt_vmr_debug_level_buf_get(struct vmr_drvdata *vmr, char **buf, u32 *len)
 {
 	*len = 10;
@@ -1200,7 +1262,13 @@ static int vmgmt_vmr_debug_level_buf_get(struct vmr_drvdata *vmr, char **buf, u3
 
 static int vmgmt_vmr_log_buf_get(struct vmr_drvdata *vmr, char **buf, u32 *len)
 {
-	return -EINVAL;
+	*len = PAGE_SIZE;
+	*buf = vmalloc(*len);
+	if (!(*buf))
+		return -ENOMEM;
+
+	vmr_log_dump_impl(vmr, VMR_LOG_MAX_RECS, *buf, vmr_log_dump_to_buf);
+	return 0;
 }
 
 int vmgmt_log_buf_get(struct vmr_drvdata *vmr, enum log_type lt, char **buf, u32 *len)
@@ -1361,10 +1429,9 @@ static void vmr_offline_services(struct vmr_drvdata *vmr)
 {
 	VMR_INFO(vmr, "vmr service are going offline...");
 
-	/*
-	 *	if (!vmr->xgq_halted)
-	 *		vmr_log_dump_all(vmr);
-	 */
+	if (!vmr->xgq_halted)
+		vmr_log_dump_all(vmr);
+	 
 	vmr_stop_services(vmr);
 
 	VMR_INFO(vmr, "vmr services are offline");
