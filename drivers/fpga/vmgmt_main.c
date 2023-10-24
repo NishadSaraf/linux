@@ -321,9 +321,15 @@ void read_completion(struct xgq_com_queue_entry *ccmd, u64 addr)
 	xgq_reg_write32(0, addr, 0x0);
 }
 
+static void vmr_log_dump_cmd(struct vmr_drvdata *vmr, struct vmr_cmd *cmd)
+{
+	VMR_WARN(vmr, "opcode: 0x%x, rcode: %d", cmd->xgq_cmd_entry.hdr.opcode, cmd->xgq_cmd_rcode);
+}
+
 static void vmr_cmd_complete(struct vmr_cmd *cmd, struct xgq_com_queue_entry *ccmd)
 {
 	struct xgq_cmd_cq *cmd_cq = (struct xgq_cmd_cq *)ccmd;
+	struct vmr_drvdata *vmr = cmd->xgq_vmr;
 
 	cmd->xgq_cmd_rcode = (int)ccmd->rcode;
 	/* preserve payload prior to free xgq_cmd_cq */
@@ -332,10 +338,8 @@ static void vmr_cmd_complete(struct vmr_cmd *cmd, struct xgq_com_queue_entry *cc
 
 	complete(&cmd->xgq_cmd_complete);
 
-	/*
-	 *	if (cmd->xgq_cmd_rcode)
-	 *		vmr_log_dump_debug(vmr, cmd);
-	 */
+	if (cmd->xgq_cmd_rcode)
+		vmr_log_dump_cmd(vmr, cmd);
 }
 
 static void cmd_complete(struct vmr_drvdata *vmr, struct xgq_com_queue_entry *ccmd)
@@ -1932,13 +1936,10 @@ static int versal_fpga_write_complete(struct fpga_manager *mgr,
 	}
 
 	ret = vmr_wait_not_killable(vmr->fw_tnx.cmd);
-	if (!ret) {
+	if (ret) {
 		VMR_ERR(vmr, "Image download timed out");
-		ret = -ETIMEDOUT;
 		vmr->state = FPGA_MGR_STATE_WRITE_COMPLETE_ERR;
 		goto done;
-	} else {
-		ret = 0;
 	}
 
 	vmr->state = FPGA_MGR_STATE_WRITE_COMPLETE;
