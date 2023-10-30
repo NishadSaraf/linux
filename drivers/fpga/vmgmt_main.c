@@ -1103,7 +1103,7 @@ static int vmr_get_intf_uuid(struct vmr_drvdata *vmr)
 	VMR_INFO(vmr, "cast fw to string %s", buf);
 
 	/* parse uuid into a valid uuid string format */
-	for (i  = 0, j = 0; i < size; i++) {
+	for (i  = 0, j = 0; i < strlen(buf); i++) {
 		str[j++] = buf[i];
 		if (j == 8 || j == 13 || j == 18 || j == 23)
 			str[j++] = '-';
@@ -1197,7 +1197,7 @@ static int vmr_log_dump_to_dmesg(struct vmr_drvdata *vmr, char *buf, char *log_b
 }
 
 static int vmr_log_dump_to_buf(struct vmr_drvdata *vmr, char *buf, char *log_buf)
-{       
+{
 	return buf == NULL ? 0 : snprintf(buf, PAGE_SIZE, "%s\n", log_buf);
 }
 
@@ -1435,7 +1435,7 @@ static void vmr_offline_services(struct vmr_drvdata *vmr)
 
 	if (!vmr->xgq_halted)
 		vmr_log_dump_all(vmr);
-	 
+
 	vmr_stop_services(vmr);
 
 	VMR_INFO(vmr, "vmr services are offline");
